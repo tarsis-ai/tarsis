@@ -1,0 +1,21 @@
+# Core web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# HTTP client
+httpx==0.27.2
+
+# Environment variables
+python-dotenv==1.0.1
+
+# LLM Providers
+anthropic==0.40.0  # For Claude models (optional)
+openai==1.55.0  # For OpenAI models (optional)
+google-generativeai==0.8.3  # For Gemini models (optional)
+
+# JSON schema validation (optional, for tool schemas)
+pydantic==2.10.2
+
+# Git and code search
+GitPython==3.1.43  # For local git operations
+ripgrepy==2.0.0  # For code search (ripgrep wrapper)
