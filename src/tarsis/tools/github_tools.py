@@ -11,9 +11,24 @@ These tools allow the agent to interact with GitHub:
 """
 
 import os
-from typing import Dict, Any, Optional
+import logging
+from typing import Dict, Any, Optional, List
 from .base import BaseToolHandler, ToolDefinition, ToolResponse, ToolCategory
 from ..github import GitHubClient, GitHubConfig
+from ..commit.message_generator import (
+    generate_commit_message,
+    CommitContext,
+    FileChange
+)
+from ..commit.grouping import (
+    CommitGrouper,
+    TypeBasedGrouping,
+    DependencyAwareGrouping,
+    SizeBasedGrouping,
+    should_use_multi_commit
+)
+
+logger = logging.getLogger(__name__)
 
 
 # Global GitHub client instance
@@ -367,7 +382,9 @@ class ModifyFileHandler(BaseToolHandler):
             name=self.name,
             description="""Create or update a single file on a branch and commit the change. Use this to implement code changes, create new files, or update existing ones.
 
-💡 **Reminder**: After modifying files, use `run_validation` to check for errors before creating a pull request.""",
+💡 **Reminder**: After modifying files, use `run_validation` to check for errors before creating a pull request.
+
+🤖 **AI-Powered Commit Messages**: Set `auto_generate_message: true` to automatically generate a conventional commit message based on the file changes. When enabled, `commit_message` can be omitted or empty.""",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -385,16 +402,21 @@ class ModifyFileHandler(BaseToolHandler):
                     },
                     "commit_message": {
                         "type": "string",
-                        "description": "Commit message describing the change"
+                        "description": "Commit message describing the change. Optional if auto_generate_message is true."
                     },
                     "operation": {
                         "type": "string",
                         "enum": ["create", "update", "auto"],
                         "description": "Operation type: 'create' (file must not exist), 'update' (file must exist), 'auto' (detect automatically). Default: auto",
                         "default": "auto"
+                    },
+                    "auto_generate_message": {
+                        "type": "boolean",
+                        "description": "If true, automatically generate a conventional commit message using AI. When enabled, commit_message can be omitted. Default: false",
+                        "default": False
                     }
                 },
-                "required": ["file_path", "content", "branch", "commit_message"]
+                "required": ["file_path", "content", "branch"]
             },
             category=self.category
         )
@@ -408,8 +430,66 @@ class ModifyFileHandler(BaseToolHandler):
             file_path = input_data["file_path"]
             content = input_data["content"]
             branch = input_data["branch"]
-            commit_message = input_data["commit_message"]
+            commit_message = input_data.get("commit_message", "")
             operation = input_data.get("operation", "auto")
+            auto_generate = input_data.get("auto_generate_message", False)
+
+            # Generate commit message if requested
+            if auto_generate and (not commit_message or commit_message.strip() == ""):
+                # Check if we have LLM provider in context
+                llm_provider = getattr(context, 'llm_provider', None)
+                if not llm_provider:
+                    return self._error_response(
+                        Exception(
+                            "AI commit message generation requires LLM provider. "
+                            "Cannot auto-generate without LLM access."
+                        )
+                    )
+
+                try:
+                    # Determine operation type first for better message generation
+                    branch_sha = await github.get_branch_sha(branch)
+                    file_exists = await github.get_file_content(file_path, ref=branch) is not None
+                    actual_operation = "update" if file_exists else "create"
+
+                    # Create file change context
+                    file_change = FileChange(
+                        path=file_path,
+                        change_type=actual_operation,
+                        additions=len(content.split("\n")),
+                        deletions=0,
+                        diff_snippet=None
+                    )
+
+                    commit_context = CommitContext(
+                        file_changes=[file_change],
+                        branch_name=branch
+                    )
+
+                    # Generate message
+                    logger.info(f"Generating commit message for {file_path} ({actual_operation})")
+                    generated = await generate_commit_message(
+                        context=commit_context,
+                        llm_provider=llm_provider,
+                        temperature=0.3
+                    )
+
+                    commit_message = generated.message
+                    logger.info(f"Generated commit message: {commit_message.split(chr(10))[0]}")
+
+                except Exception as e:
+                    logger.error(f"Failed to generate commit message: {e}")
+                    return self._error_response(
+                        Exception(f"Failed to generate commit message: {e}")
+                    )
+
+            # Validate commit message is present
+            if not commit_message or commit_message.strip() == "":
+                return self._error_response(
+                    Exception(
+                        "commit_message is required. Either provide a message or set auto_generate_message=true."
+                    )
+                )
 
             # Get branch HEAD
             try:
@@ -500,9 +580,19 @@ class CommitChangesHandler(BaseToolHandler):
     def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
-            description="""Commit multiple file changes (create/update/delete) atomically in a single commit. Use this when implementing features that require changes to multiple files.
+            description="""Commit multiple file changes (create/update/delete) atomically. Supports both single-commit and multi-commit modes.
 
-💡 **Reminder**: After committing changes, use `run_validation` to check for errors before creating a pull request.""",
+**Single-commit mode** (default): All changes in one commit
+**Multi-commit mode**: Intelligently groups changes into logical commits by type (feat/fix/test/docs)
+
+💡 **Reminder**: After committing changes, use `run_validation` to check for errors before creating a pull request.
+
+🤖 **AI-Powered Commit Messages**: Set `auto_generate_message: true` to automatically generate conventional commit messages.
+
+📦 **Multi-commit Grouping**: Set `multi_commit: true` for large changesets (>5 files). Groups changes into logical commits:
+- Separate commits for tests, docs, CI changes
+- Ordered by dependencies (build → refactor → feat/fix → test → docs)
+- Falls back to single commit when grouping adds no value""",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -512,7 +602,7 @@ class CommitChangesHandler(BaseToolHandler):
                     },
                     "commit_message": {
                         "type": "string",
-                        "description": "Commit message describing all changes"
+                        "description": "Commit message (required for single-commit, optional for multi-commit with auto_generate_message)"
                     },
                     "files": {
                         "type": "array",
@@ -537,26 +627,110 @@ class CommitChangesHandler(BaseToolHandler):
                             "required": ["path", "operation"]
                         },
                         "minItems": 1
+                    },
+                    "auto_generate_message": {
+                        "type": "boolean",
+                        "description": "If true, automatically generate conventional commit message(s) using AI. Default: false",
+                        "default": False
+                    },
+                    "multi_commit": {
+                        "type": "boolean",
+                        "description": "If true, group changes into multiple logical commits. Recommended for >5 files. Default: false",
+                        "default": False
+                    },
+                    "max_commits": {
+                        "type": "integer",
+                        "description": "Maximum commits to create in multi-commit mode. Default: 5",
+                        "default": 5
                     }
                 },
-                "required": ["branch", "commit_message", "files"]
+                "required": ["branch", "files"]
             },
             category=self.category
         )
 
     async def execute(self, input_data: Dict[str, Any], context: Any) -> ToolResponse:
-        """Execute: Commit multiple file changes"""
+        """Execute: Commit multiple file changes (single or multi-commit mode)"""
         github = _get_github_client()
         await github.connect()
 
         try:
             branch = input_data["branch"]
-            commit_message = input_data["commit_message"]
+            commit_message = input_data.get("commit_message", "")
             files = input_data["files"]
+            auto_generate = input_data.get("auto_generate_message", False)
+            multi_commit = input_data.get("multi_commit", False)
+            max_commits = input_data.get("max_commits", 5)
 
             # Validate at least one file
             if not files:
                 return self._error_response(Exception("At least one file change is required"))
+
+            # Multi-commit mode: Group changes into logical commits
+            if multi_commit:
+                return await self._multi_commit_flow(
+                    github, branch, files, auto_generate, max_commits, context
+                )
+
+            # Single-commit mode (existing logic)
+            # Generate commit message if requested
+            if auto_generate and (not commit_message or commit_message.strip() == ""):
+                # Check if we have LLM provider in context
+                llm_provider = getattr(context, 'llm_provider', None)
+                if not llm_provider:
+                    return self._error_response(
+                        Exception(
+                            "AI commit message generation requires LLM provider. "
+                            "Cannot auto-generate without LLM access."
+                        )
+                    )
+
+                try:
+                    # Create file changes context
+                    file_changes = []
+                    for file_info in files:
+                        path = file_info["path"]
+                        operation = file_info["operation"]
+                        content = file_info.get("content", "")
+
+                        file_change = FileChange(
+                            path=path,
+                            change_type=operation,
+                            additions=len(content.split("\n")) if content else 0,
+                            deletions=0,
+                            diff_snippet=None
+                        )
+                        file_changes.append(file_change)
+
+                    commit_context = CommitContext(
+                        file_changes=file_changes,
+                        branch_name=branch
+                    )
+
+                    # Generate message
+                    logger.info(f"Generating commit message for {len(files)} file(s)")
+                    generated = await generate_commit_message(
+                        context=commit_context,
+                        llm_provider=llm_provider,
+                        temperature=0.3
+                    )
+
+                    commit_message = generated.message
+                    logger.info(f"Generated commit message: {commit_message.split(chr(10))[0]}")
+
+                except Exception as e:
+                    logger.error(f"Failed to generate commit message: {e}")
+                    return self._error_response(
+                        Exception(f"Failed to generate commit message: {e}")
+                    )
+
+            # Validate commit message is present
+            if not commit_message or commit_message.strip() == "":
+                return self._error_response(
+                    Exception(
+                        "commit_message is required. Either provide a message or set auto_generate_message=true."
+                    )
+                )
 
             # Get branch HEAD
             try:
@@ -648,3 +822,257 @@ class CommitChangesHandler(BaseToolHandler):
             return self._error_response(e)
         finally:
             await github.close()
+
+    async def _multi_commit_flow(
+        self,
+        github: GitHubClient,
+        branch: str,
+        files: List[Dict[str, Any]],
+        auto_generate: bool,
+        max_commits: int,
+        context: Any
+    ) -> ToolResponse:
+        """
+        Execute multi-commit flow with intelligent grouping.
+
+        Groups file changes into logical commits based on type, dependencies, and size.
+        Falls back to single commit when grouping adds no value.
+
+        Args:
+            github: GitHub client instance
+            branch: Target branch name
+            files: List of file changes (path, content, operation)
+            auto_generate: Whether to auto-generate commit messages
+            max_commits: Maximum number of commits to create
+            context: Agent context (for LLM provider access)
+
+        Returns:
+            ToolResponse with commit details or error
+        """
+        try:
+            # 1. Convert input files to FileChange objects
+            file_changes = []
+            for file_info in files:
+                path = file_info["path"]
+                operation = file_info["operation"]
+                content = file_info.get("content", "")
+
+                file_change = FileChange(
+                    path=path,
+                    change_type=operation,
+                    additions=len(content.split("\n")) if content else 0,
+                    deletions=0,
+                    diff_snippet=None
+                )
+                file_changes.append(file_change)
+
+            # 2. Check if multi-commit is beneficial
+            if not should_use_multi_commit(file_changes, min_files=5):
+                logger.info("Multi-commit adds no value, falling back to single commit")
+                # Fall back to single commit by calling parent logic
+                single_files = files
+                single_message = ""
+                if auto_generate:
+                    # Generate single commit message
+                    llm_provider = getattr(context, 'llm_provider', None)
+                    if llm_provider:
+                        commit_context = CommitContext(
+                            file_changes=file_changes,
+                            branch_name=branch
+                        )
+                        generated = await generate_commit_message(
+                            context=commit_context,
+                            llm_provider=llm_provider,
+                            temperature=0.3
+                        )
+                        single_message = generated.message
+
+                # Re-route to single commit logic (lines 676-819)
+                # This is intentional fallback
+                input_data = {
+                    "branch": branch,
+                    "files": single_files,
+                    "commit_message": single_message,
+                    "auto_generate_message": auto_generate
+                }
+                return await self.execute(input_data, context)
+
+            # 3. Validate LLM provider for auto-generation
+            if not auto_generate:
+                return self._error_response(
+                    Exception(
+                        "Multi-commit mode requires auto_generate_message=true. "
+                        "Commit messages for each group must be generated automatically."
+                    )
+                )
+
+            llm_provider = getattr(context, 'llm_provider', None)
+            if not llm_provider:
+                return self._error_response(
+                    Exception(
+                        "AI commit message generation requires LLM provider. "
+                        "Cannot use multi-commit mode without LLM access."
+                    )
+                )
+
+            # 4. Group files using strategies
+            logger.info(f"Grouping {len(file_changes)} files into logical commits (max: {max_commits})")
+            grouper = CommitGrouper(
+                grouping_strategy=TypeBasedGrouping(min_files_per_group=2, merge_threshold=2),
+                refinement_strategies=[
+                    DependencyAwareGrouping(),
+                    SizeBasedGrouping(max_files=15, max_loc=500)
+                ],
+                max_groups=max_commits
+            )
+
+            commit_groups = grouper.group_and_order(file_changes)
+            logger.info(f"Created {len(commit_groups)} commit groups")
+
+            # 5. If only 1 group resulted, fall back to single commit
+            if len(commit_groups) == 1:
+                logger.info("Grouping resulted in 1 group, using single commit")
+                input_data = {
+                    "branch": branch,
+                    "files": files,
+                    "auto_generate_message": True
+                }
+                return await self.execute(input_data, context)
+
+            # 6. Get current branch SHA
+            try:
+                current_sha = await github.get_branch_sha(branch)
+            except Exception as e:
+                return self._error_response(
+                    Exception(f"Branch '{branch}' not found. Create it first using create_branch tool.")
+                )
+
+            # 7. Create commits sequentially
+            commit_shas = []
+            commit_summaries = []
+
+            for group_index, group in enumerate(commit_groups):
+                logger.info(f"Creating commit {group_index + 1}/{len(commit_groups)}: {group.commit_type.value} ({group.file_count} files)")
+
+                # 7a. Generate commit message for this group
+                commit_context = CommitContext(
+                    file_changes=group.files,
+                    branch_name=branch,
+                    additional_context=f"Part {group_index + 1} of {len(commit_groups)}: {group.commit_type.value} changes"
+                )
+
+                try:
+                    generated = await generate_commit_message(
+                        context=commit_context,
+                        llm_provider=llm_provider,
+                        temperature=0.3
+                    )
+                    message = generated.message
+
+                    # Add footer to indicate multi-commit sequence
+                    message += f"\n\n---\nCommit {group_index + 1} of {len(commit_groups)} ({group.commit_type.value})"
+
+                except Exception as e:
+                    logger.error(f"Failed to generate commit message for group {group_index + 1}: {e}")
+                    # Use fallback message
+                    message = f"{group.commit_type.value}: {group.description_hint or 'update files'}\n\nCommit {group_index + 1} of {len(commit_groups)}"
+
+                # 7b. Get current tree
+                tree_data = await github.get_git_tree(current_sha, recursive=False)
+                base_tree_sha = tree_data["sha"]
+
+                # 7c. Build tree changes for this group
+                tree_changes = []
+                for file_change in group.files:
+                    # Find original file info from input
+                    original_file = next((f for f in files if f["path"] == file_change.path), None)
+                    if not original_file:
+                        logger.warning(f"File {file_change.path} not found in original input")
+                        continue
+
+                    path = original_file["path"]
+                    operation = original_file["operation"]
+                    content = original_file.get("content")
+
+                    if operation in ["create", "update"]:
+                        if content is None:
+                            logger.error(f"File '{path}': content is required for {operation} operation")
+                            continue
+
+                        # Create blob
+                        blob_sha = await github.create_blob(content)
+
+                        tree_changes.append({
+                            "path": path,
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": blob_sha
+                        })
+
+                    elif operation == "delete":
+                        tree_changes.append({
+                            "path": path,
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": None  # Null SHA means delete
+                        })
+
+                # 7d. Create tree and commit
+                new_tree_sha = await github.create_tree(base_tree_sha, tree_changes)
+                new_commit_sha = await github.create_commit(
+                    tree_sha=new_tree_sha,
+                    parent_sha=current_sha,
+                    message=message
+                )
+
+                # 7e. Update branch ref to point to new commit
+                await github.update_branch_ref(branch, new_commit_sha)
+
+                # 7f. Update current SHA for next iteration
+                current_sha = new_commit_sha
+                commit_shas.append(new_commit_sha)
+
+                # 7g. Build summary for this commit
+                commit_summaries.append({
+                    "sha": new_commit_sha[:8],
+                    "message": message.split("\n")[0],  # First line only
+                    "type": group.commit_type.value,
+                    "files": len(group.files),
+                    "file_paths": [f.path for f in group.files],
+                    "loc": group.total_loc
+                })
+
+                logger.info(f"Created commit {new_commit_sha[:8]}: {message.split(chr(10))[0]}")
+
+            # 8. Build success message
+            result = f"✅ Created {len(commit_shas)} commits with intelligent grouping on branch '{branch}'\\n\\n"
+            result += "**Commits Created:**\\n"
+
+            for i, summary in enumerate(commit_summaries, 1):
+                result += f"\\n{i}. **{summary['sha']}** ({summary['type']})\\n"
+                result += f"   {summary['message']}\\n"
+                result += f"   Files: {summary['files']}, LOC: {summary['loc']}\\n"
+                result += f"   Changed: {', '.join(summary['file_paths'][:3])}"
+                if len(summary['file_paths']) > 3:
+                    result += f" (+{len(summary['file_paths']) - 3} more)"
+                result += "\\n"
+
+            result += "\\n💡 **Next step**: Run `run_validation` to check for errors before creating a pull request."
+
+            return self._success_response(
+                result,
+                metadata={
+                    "branch": branch,
+                    "commit_count": len(commit_shas),
+                    "commit_shas": commit_shas,
+                    "commits": commit_summaries,
+                    "total_files": len(files),
+                    "multi_commit": True
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Multi-commit operation failed: {e}")
+            return self._error_response(
+                Exception(f"Multi-commit operation failed: {e}")
+            )

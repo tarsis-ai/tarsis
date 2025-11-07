@@ -54,7 +54,7 @@ def main():
     """Run the Tarsis server."""
     print("""
 ╔══════════════════════════════════════════════════════════════╗
-║                    Tarsis Agent v0.1                         ║
+║                    Tarsis Agent v0.2                         ║
 ║          AI-Powered GitHub Issue Implementation              ║
 ╚══════════════════════════════════════════════════════════════╝
 

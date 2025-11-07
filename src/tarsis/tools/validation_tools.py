@@ -113,41 +113,42 @@ Use this tool to validate your changes and get feedback before submitting.""",
             require_tests = input_data.get("require_tests", False)
             no_tests_behavior = input_data.get("no_tests_behavior", "ask")
 
-            # Get repository path from context
-            repo_path = self._get_repo_path(context)
+            # Get repository path from context (using clone manager if available)
+            repo_path = await self._get_repo_path(context)
 
             # Check if we have a local clone
-            if not self._has_local_clone(repo_path):
+            if not repo_path or not self._has_local_clone(repo_path):
                 # No local clone available - skip validation gracefully
                 skip_message = """✨ Validation Status: SKIPPED
 
-**Reason:** Validation requires a local clone of the repository.
+**Reason:** Local clone is not available.
 
 **Current State:**
-- Tarsis operates via GitHub API (no local clone yet)
-- Validation tools (pytest, mypy, eslint, etc.) need files on disk
-- This feature will be available once Local Repository Management is implemented
+- Validation tools (pytest, mypy, eslint, etc.) require files on disk
+- The local repository clone could not be initialized
+- This may be due to missing GITHUB_TOKEN or other configuration issues
 
 **What this means:**
 - Your code changes were committed successfully ✅
 - Syntax and basic checks passed (file creation succeeded) ✅
-- Full validation (tests, linting, static analysis) will be available in a future update ⏳
+- Full validation (tests, linting, static analysis) requires a local clone
 
 **Recommendation:**
 - Review your code manually before creating the PR
-- Or wait for the local repository management feature for automated validation
+- Check that GITHUB_TOKEN is set in your environment
+- Ensure GitPython is installed: pip install GitPython
 
-You can proceed to create a pull request. The validation enforcement is in place and will work automatically once local repository management is implemented."""
+You can proceed to create a pull request."""
 
                 return self._success_response(
-                    skip_message,  # First positional argument, not 'result='
+                    skip_message,
                     metadata={
                         "validation_status": "skipped",
                         "reason": "no_local_clone",
                         "tier_used": "none",
-                        "passed": True,  # Treat as passed so PR creation isn't blocked
+                        "passed": True,
                         "has_failures": False,
-                        "local_repo_required": True
+                        "requires_local_clone": True
                     }
                 )
 
@@ -197,60 +198,70 @@ You can proceed to create a pull request. The validation enforcement is in place
             # Also generate PR comment format
             pr_comment = ValidationReporter.generate_pr_comment(validation_result)
 
-            # Determine success
-            success = validation_result.status in (
-                ValidationStatus.PASSED,
-                ValidationStatus.SKIPPED
+            # Always return success response (tool executed successfully)
+            # The validation result status indicates whether validation passed or failed
+            return self._success_response(
+                formatted_result,
+                metadata={
+                    "validation_status": validation_result.status.value,
+                    "tier_used": validation_result.tier_used.value,
+                    "passed": validation_result.passed,
+                    "has_failures": validation_result.has_failures,
+                    "duration": validation_result.duration,
+                    "pr_comment": pr_comment,
+                    "user_decision": validation_result.user_decision,
+                    "test_result": self._serialize_test_result(validation_result),
+                    "failure_summary": validation_result.get_failure_summary() if validation_result.has_failures else None
+                }
             )
-
-            # Return result
-            if success:
-                return self._success_response(
-                    formatted_result,  # First positional argument, not 'result='
-                    metadata={
-                        "validation_status": validation_result.status.value,
-                        "tier_used": validation_result.tier_used.value,
-                        "passed": validation_result.passed,
-                        "has_failures": validation_result.has_failures,
-                        "duration": validation_result.duration,
-                        "pr_comment": pr_comment,
-                        "user_decision": validation_result.user_decision,
-                        # Include specific results for agent to parse
-                        "test_result": self._serialize_test_result(validation_result),
-                        "failure_summary": validation_result.get_failure_summary() if validation_result.has_failures else None
-                    }
-                )
-            else:
-                # Combine formatted result and PR comment for error response
-                error_content = f"{formatted_result}\n\n---\n\n{pr_comment}"
-                return self._error_response(Exception(error_content))
 
         except Exception as e:
             error_msg = f"Failed to run validation: {str(e)}\nError type: {type(e).__name__}"
             return self._error_response(Exception(error_msg))
 
-    def _get_repo_path(self, context: Any) -> str:
+    async def _get_repo_path(self, context: Any) -> str:
         """
         Get repository path from context.
+
+        Uses clone manager if available, otherwise falls back to configured path.
 
         Args:
             context: Task context
 
         Returns:
-            Repository path as string
+            Repository path as string, or None if no clone available
         """
-        # Try to get from context (depends on how AgentTask is structured)
+        # Try to use clone manager
+        if hasattr(context, "clone_manager") and context.clone_manager:
+            try:
+                # Checkout the working branch if available
+                branch = getattr(context, "branch_name", None)
+
+                # Ensure clone exists and checkout correct branch
+                repo_path = await context.clone_manager.ensure_clone(
+                    branch=branch,
+                    shallow=True  # Shallow clone is sufficient for validation
+                )
+                return repo_path
+            except Exception as e:
+                # Clone failed - log but continue to fallback
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to clone repository: {e}")
+                # Fall through to other methods
+
+        # Try to get from context (legacy support)
         if hasattr(context, "repository_path"):
             return str(context.repository_path)
 
-        # Try to get from config
+        # Try to get from config (legacy support)
         if hasattr(context, "config"):
             config = context.config
             if hasattr(config, "repository_path"):
                 return str(config.repository_path)
 
-        # Default to current directory (for local testing)
-        return "."
+        # No path available
+        return None
 
     def _has_local_clone(self, repo_path: str) -> bool:
         """

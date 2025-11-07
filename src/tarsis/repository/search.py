@@ -254,7 +254,7 @@ class CodeSearcher:
                         match_start=match_start,
                         match_end=match_end,
                         context_before=context_before.copy(),
-                        context_after=[],  # Will be populated by context messages
+                        context_after=[],
                         language=language,
                         category=category
                     )

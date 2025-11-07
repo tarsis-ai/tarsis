@@ -189,8 +189,6 @@ async def github_webhook(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid payload")
 
-    # TODO: Validate webhook signature for production
-
     # Check if this is an issue comment created event
     if "issue" not in payload or "comment" not in payload or payload.get("action") != "created":
         return {"status": "ignored", "reason": "not an issue comment created event"}

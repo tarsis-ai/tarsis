@@ -23,7 +23,7 @@ from ..github import GitHubClient, GitHubConfig
 import subprocess
 
 
-# Global instances
+# Global instances (DEPRECATED - kept for backward compatibility)
 _code_searcher: Optional[CodeSearcher] = None
 _symbol_finder: Optional[SymbolFinder] = None
 _repo_clone_path: Optional[str] = None
@@ -31,7 +31,10 @@ _repo_clone_path: Optional[str] = None
 
 def _get_or_clone_repository() -> str:
     """
-    Get or clone the repository locally for searching.
+    DEPRECATED: Get or clone the repository locally for searching.
+
+    This function is kept for backward compatibility but should not be used.
+    Use CloneManager from context instead.
 
     Returns:
         Path to local repository
@@ -77,7 +80,11 @@ def _get_or_clone_repository() -> str:
 
 
 def _get_code_searcher() -> CodeSearcher:
-    """Get or create the code searcher instance."""
+    """
+    DEPRECATED: Get or create the code searcher instance.
+
+    Kept for backward compatibility.
+    """
     global _code_searcher
 
     if _code_searcher is None:
@@ -88,7 +95,11 @@ def _get_code_searcher() -> CodeSearcher:
 
 
 def _get_symbol_finder() -> SymbolFinder:
-    """Get or create the symbol finder instance."""
+    """
+    DEPRECATED: Get or create the symbol finder instance.
+
+    Kept for backward compatibility.
+    """
     global _symbol_finder
 
     if _symbol_finder is None:
@@ -96,6 +107,35 @@ def _get_symbol_finder() -> SymbolFinder:
         _symbol_finder = SymbolFinder(searcher)
 
     return _symbol_finder
+
+
+async def _get_repo_path_from_context(context: Any) -> str:
+    """
+    Get repository path from context using clone manager.
+
+    Args:
+        context: Task context with clone_manager
+
+    Returns:
+        Repository path as string
+
+    Raises:
+        RuntimeError: If unable to get repository path
+    """
+    # Try to use clone manager
+    if hasattr(context, "clone_manager") and context.clone_manager:
+        try:
+            # Ensure clone exists
+            repo_path = await context.clone_manager.ensure_clone(shallow=True)
+            return repo_path
+        except Exception as e:
+            # Clone failed - fall through to deprecated method
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to use clone manager: {e}, falling back to legacy method")
+
+    # Fallback to deprecated global method (for backward compatibility)
+    return _get_or_clone_repository()
 
 
 class SearchCodeHandler(BaseToolHandler):
@@ -165,8 +205,11 @@ class SearchCodeHandler(BaseToolHandler):
             context_lines = input_data.get("context_lines", 2)
             max_results = input_data.get("max_results", 30)
 
-            # Get searcher
-            searcher = _get_code_searcher()
+            # Get repository path (using clone manager if available)
+            repo_path = await _get_repo_path_from_context(context)
+
+            # Create searcher for this request
+            searcher = CodeSearcher(repo_path)
 
             # Build search options
             options = SearchOptions(
@@ -309,8 +352,12 @@ class FindSymbolHandler(BaseToolHandler):
                         ValueError(f"Invalid language: {language_str}")
                     )
 
-            # Get symbol finder
-            finder = _get_symbol_finder()
+            # Get repository path (using clone manager if available)
+            repo_path = await _get_repo_path_from_context(context)
+
+            # Create searcher and symbol finder for this request
+            searcher = CodeSearcher(repo_path)
+            finder = SymbolFinder(searcher)
 
             # Find symbols
             results = finder.find_symbol(
@@ -446,8 +493,11 @@ class GrepPatternHandler(BaseToolHandler):
             max_results = input_data.get("max_results", 30)
             sort_by = input_data.get("sort_by", "relevance")
 
-            # Get searcher
-            searcher = _get_code_searcher()
+            # Get repository path (using clone manager if available)
+            repo_path = await _get_repo_path_from_context(context)
+
+            # Create searcher for this request
+            searcher = CodeSearcher(repo_path)
 
             # Build search options
             options = SearchOptions(

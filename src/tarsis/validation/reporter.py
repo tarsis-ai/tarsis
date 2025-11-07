@@ -250,13 +250,52 @@ class ValidationReporter:
         if result.has_failures:
             text += f"**Failures:** {result.get_failure_summary()}\n\n"
 
-            # Add specific failure info
+            # Add specific failure info based on tier
             if result.test_result and result.test_result.failures:
                 text += "**Failed Tests:**\n"
                 for failure in result.test_result.failures[:5]:
                     text += f"- {failure.test_name}: {failure.error_message}\n"
                 if len(result.test_result.failures) > 5:
                     text += f"  ... and {len(result.test_result.failures) - 5} more\n"
+
+            elif result.syntax_result and result.syntax_result.errors:
+                text += "**Syntax Errors:**\n"
+                for error in result.syntax_result.errors[:5]:
+                    loc = f"{error.file_path}"
+                    if error.line_number:
+                        loc += f":{error.line_number}"
+                        if error.column:
+                            loc += f":{error.column}"
+                    text += f"- {loc}: {error.message}\n"
+                if len(result.syntax_result.errors) > 5:
+                    text += f"  ... and {len(result.syntax_result.errors) - 5} more\n"
+
+            elif result.analysis_result and result.analysis_result.issues:
+                text += "**Static Analysis Issues:**\n"
+                for issue in result.analysis_result.issues[:5]:
+                    loc = f"{issue.file_path}"
+                    if issue.line_number:
+                        loc += f":{issue.line_number}"
+                        if issue.column:
+                            loc += f":{issue.column}"
+                    severity = "❌" if issue.severity == "error" else "⚠️"
+                    text += f"- {severity} {loc}: {issue.message}\n"
+                if len(result.analysis_result.issues) > 5:
+                    text += f"  ... and {len(result.analysis_result.issues) - 5} more\n"
+
+            elif result.lint_result and result.lint_result.issues:
+                text += "**Linting Issues:**\n"
+                for issue in result.lint_result.issues[:5]:
+                    loc = f"{issue.file_path}"
+                    if issue.line_number:
+                        loc += f":{issue.line_number}"
+                    severity = "❌" if issue.severity == "error" else "⚠️"
+                    text += f"- {severity} {loc}: {issue.message}"
+                    if issue.rule:
+                        text += f" [{issue.rule}]"
+                    text += "\n"
+                if len(result.lint_result.issues) > 5:
+                    text += f"  ... and {len(result.lint_result.issues) - 5} more\n"
 
         return text
 

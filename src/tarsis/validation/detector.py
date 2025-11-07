@@ -114,7 +114,6 @@ class TestFrameworkDetector:
         if has_tests:
             validation_tier = ValidationTier.TESTS
         else:
-            # Will be determined by ValidationTierDetector
             validation_tier = ValidationTier.SYNTAX
 
         return TestDetectionResult(

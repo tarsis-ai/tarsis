@@ -40,6 +40,11 @@ from .task_tools import (
 from .validation_tools import (
     RunValidationHandler
 )
+from .git_local_tools import (
+    RenameFileHandler,
+    CreateSymlinkHandler,
+    ModifyFilesLocalHandler
+)
 
 
 def create_default_tool_executor() -> ToolExecutor:
@@ -85,6 +90,12 @@ def create_default_tool_executor() -> ToolExecutor:
     # Register validation tools (no user interaction in webhook mode)
     executor.register(RunValidationHandler(ask_followup_handler=None))
 
+    # Register local git operation tools
+    executor.register(RenameFileHandler())
+    executor.register(CreateSymlinkHandler())
+    executor.register(ModifyFilesLocalHandler())
+
+    # Total: 20 tools (17 previous + 3 new local git tools)
     return executor
 
 
@@ -122,4 +133,8 @@ __all__ = [
     "CreatePlanHandler",
     # Validation tools
     "RunValidationHandler",
+    # Local git tools
+    "RenameFileHandler",
+    "CreateSymlinkHandler",
+    "ModifyFilesLocalHandler",
 ]

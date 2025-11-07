@@ -9,8 +9,10 @@ Tarsis is an autonomous AI agent that implements GitHub issues using a custom re
 - **Autonomous Implementation**: Recursive agent loop with multi-step planning and execution
 - **Multi-LLM Support**: Works with Anthropic Claude, Ollama (local), and Google Gemini
 - **Intelligent Code Discovery**: Hybrid file discovery combining filesystem scanning, code search (ripgrep), and LLM reasoning
-- **Built-in Validation**: Automatic testing and validation before PR creation (supports pytest, jest, go test, cargo test, and more)
-- **Tool-Based Architecture**: 17 production tools for GitHub operations, file management, code search, and validation
+- **Advanced Multi-Tier Validation**: 5-tier validation system (tests → static analysis → linting → syntax → dependency validation)
+- **Local Repository Operations**: Full local clone management with branch operations and lifecycle management
+- **Conventional Commits**: AI-powered commit message generation with validation and formatting
+- **Tool-Based Architecture**: 20 production tools for GitHub operations, file management, code search, validation, and local git operations
 - **Extensible Design**: Modular prompt system and plugin-style tool architecture
 
 ## Quick Start
@@ -97,22 +99,29 @@ GitHub Webhook → AgentTask (recursive loop) → LLM Provider (Claude/Ollama/Ge
                        ↓
                  Tool Executor
                        ↓
-    ┌──────────────────┼──────────────────┐
-    ↓                  ↓                  ↓
-GitHub Tools     File Operations    Code Search
-(6 tools)           (4 tools)         (3 tools)
+    ┌──────────────────┼──────────────────────┐
+    ↓                  ↓                      ↓
+GitHub Tools     File Operations     Code Search & Discovery
+(6 tools)           (4 tools)              (4 tools)
+    ↓                  ↓                      ↓
+Task Tools      Validation Tools      Local Git Operations
+(2 tools)           (1 tool)              (3 tools)
 ```
 
-The agent autonomously plans and executes tasks using 17 production tools across multiple categories.
+The agent autonomously plans and executes tasks using 20 production tools across multiple categories.
 
-## Current Status (v0.1.0)
+## Current Status (v0.2.0)
 
 - ✅ Core agentic architecture (recursive agent loop)
-- ✅ 17 production tools (GitHub, file operations, code search, validation)
+- ✅ 20 production tools (GitHub, file operations, code search, validation, local git operations)
 - ✅ Multi-provider LLM support (Anthropic, Ollama, Google)
-- ✅ Intelligent file discovery and code search
-- ✅ Validation enforcement (tests, linting, type checking)
-- ✅ Fully functional for basic to intermediate tasks
+- ✅ Intelligent file discovery and code search (hybrid approach with ripgrep)
+- ✅ **Advanced multi-tier validation system** (5 tiers: tests → static analysis → linting → syntax → dependency)
+- ✅ **Local repository clone management** with lifecycle management and branch operations
+- ✅ **Conventional commits support** with AI-powered message generation and validation
+- ✅ Local git operations (file rename, symlink creation, local file modifications)
+- ✅ Dependency and import validation
+- ✅ Fully functional for basic to advanced tasks
 
 ## Tech Stack
 

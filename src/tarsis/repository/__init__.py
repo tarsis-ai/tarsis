@@ -22,6 +22,15 @@ from .discovery import (
     FileDiscoveryResult,
     DiscoveryStrategy
 )
+from .local import CloneManager, CloneError
+from .file_operations import (
+    rename_file,
+    create_symlink,
+    can_create_symlinks,
+    safe_push,
+    batch_modify_files,
+    FileOperationError
+)
 
 __all__ = [
     # Scanner
@@ -42,5 +51,15 @@ __all__ = [
     # Discovery
     "HybridDiscoveryEngine",
     "FileDiscoveryResult",
-    "DiscoveryStrategy"
+    "DiscoveryStrategy",
+    # Local clone management
+    "CloneManager",
+    "CloneError",
+    # File operations
+    "rename_file",
+    "create_symlink",
+    "can_create_symlinks",
+    "safe_push",
+    "batch_modify_files",
+    "FileOperationError"
 ]

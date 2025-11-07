@@ -148,6 +148,15 @@ class ValidationOrchestrator:
         runner = TestRunner(str(self.repo_path))
         test_result = await runner.run_tests(detection_result, modified_files)
 
+        # Check if no tests were found (0 total tests)
+        if test_result.total_tests == 0:
+            # No tests found - fall back to other validation tiers
+            return await self._run_fallback_validation(
+                detection_result,
+                modified_files,
+                user_decision=f"No tests found - using fallback validation (syntax checking)"
+            )
+
         # If test execution failed (e.g., pytest not installed), fall back to other validation tiers
         if test_result.status == ValidationStatus.ERROR:
             # Check if this is a "tool not found" error (pytest, jest, etc. not installed)

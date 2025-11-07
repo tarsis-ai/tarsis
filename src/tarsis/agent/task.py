@@ -10,6 +10,8 @@ This module implements the main agentic loop that:
 
 import json
 import logging
+import os
+import uuid
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -75,8 +77,8 @@ class AgentTask:
     def __init__(
         self,
         config: TaskConfig,
-        llm_provider: Any,  # Will be typed properly when we create the provider interface
-        tool_executor: Any,  # Will be typed properly when we create the tool executor
+        llm_provider: Any,
+        tool_executor: Any,
         state_manager: Any = None
     ):
         self.config = config
@@ -101,6 +103,36 @@ class AgentTask:
         self.validation_performed: bool = False
         self.validation_passed: bool = False
         self.last_validation_iteration: Optional[int] = None
+
+        # Local repository clone management
+        self.clone_manager: Optional[Any] = None
+        self._initialize_clone_manager()
+
+    def _initialize_clone_manager(self) -> None:
+        """Initialize the clone manager for local repository operations."""
+        try:
+            from ..repository import CloneManager
+
+            # Get GitHub token from environment
+            github_token = os.getenv("GITHUB_TOKEN")
+            if not github_token:
+                logger.warning("GITHUB_TOKEN not found - clone manager disabled")
+                return
+
+            # Create clone manager with unique task ID
+            task_id = str(uuid.uuid4())
+            self.clone_manager = CloneManager(
+                owner=self.config.repo_owner,
+                name=self.config.repo_name,
+                token=github_token,
+                task_id=task_id
+            )
+            logger.info(f"Clone manager initialized for {self.config.repo_owner}/{self.config.repo_name}")
+        except ImportError as e:
+            logger.warning(f"CloneManager not available: {e}")
+            logger.info("Install GitPython to enable local repository operations: pip install GitPython")
+        except Exception as e:
+            logger.warning(f"Failed to initialize clone manager: {e}")
 
     async def execute(self, initial_prompt: str) -> Dict[str, Any]:
         """
@@ -133,6 +165,15 @@ class AgentTask:
             self.status = TaskStatus.FAILED
             logger.error(f"Task failed after {self.iteration_count} iterations: {e}", exc_info=True)
             raise
+
+        finally:
+            # Cleanup local clone
+            if self.clone_manager:
+                try:
+                    logger.info("Cleaning up local repository clone...")
+                    await self.clone_manager.cleanup()
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup clone: {e}")
 
     async def _initiate_task_loop(self, user_content: Any) -> None:
         """
@@ -278,6 +319,9 @@ class AgentTask:
                 self.consecutive_mistakes = 0
                 logger.debug(f"Tool {tool_use.name} executed successfully")
 
+                # Track context from tool metadata
+                self._update_context_from_tool_result(tool_use.name, result)
+
                 # Track validation state
                 if tool_use.name == "run_validation":
                     self.validation_performed = True
@@ -292,7 +336,7 @@ class AgentTask:
                     logger.info(f"Validation performed: passed={self.validation_passed}")
 
                 # Reset validation state if files are modified after validation
-                if tool_use.name in ["modify_file", "commit_changes"]:
+                if tool_use.name in ["modify_file", "commit_changes", "modify_files_local"]:
                     if self.validation_performed:
                         logger.info("Files modified after validation - validation state reset")
                         self.validation_performed = False
@@ -406,6 +450,64 @@ class AgentTask:
                 "is_error": result.is_error
             })
         return formatted
+
+    def _update_context_from_tool_result(self, tool_name: str, result: Any) -> None:
+        """
+        Update agent context tracking based on tool execution results.
+
+        Args:
+            tool_name: Name of the tool that was executed
+            result: ToolResponse from the tool execution
+        """
+        # Extract metadata if available
+        metadata = getattr(result, 'metadata', None)
+        if not metadata:
+            return
+
+        # Track branch creation
+        if tool_name == "create_branch":
+            if "branch_name" in metadata:
+                old_branch = self.branch_name
+                self.branch_name = metadata["branch_name"]
+                logger.info(f"Context updated: branch_name = '{self.branch_name}' (was: '{old_branch}')")
+
+        # Track file modifications from modify_file
+        if tool_name == "modify_file":
+            if "file_path" in metadata:
+                file_path = metadata["file_path"]
+                self.files_modified.add(file_path)
+                logger.info(f"Context updated: added '{file_path}' to files_modified (total: {len(self.files_modified)})")
+
+        # Track file modifications from commit_changes
+        if tool_name == "commit_changes":
+            # Check for 'files' or 'files_modified' in metadata
+            files = metadata.get("files") or metadata.get("files_modified")
+            if files and isinstance(files, list):
+                for file_path in files:
+                    self.files_modified.add(file_path)
+                logger.info(f"Context updated: added {len(files)} files to files_modified (total: {len(self.files_modified)})")
+
+        # Track file modifications from modify_files_local (batch operations)
+        if tool_name == "modify_files_local":
+            if "files_modified" in metadata:
+                files = metadata["files_modified"]
+                if isinstance(files, list):
+                    for file_path in files:
+                        self.files_modified.add(file_path)
+                    logger.info(f"Context updated: added {len(files)} files to files_modified (total: {len(self.files_modified)})")
+
+        # Track PR creation
+        if tool_name == "create_pull_request":
+            if "pr_url" in metadata:
+                self.pr_url = metadata["pr_url"]
+                logger.info(f"Context updated: pr_url = '{self.pr_url}'")
+
+        # Track file accesses
+        if tool_name == "read_file":
+            if "file_path" in metadata:
+                file_path = metadata["file_path"]
+                self.files_accessed.add(file_path)
+                logger.debug(f"Context updated: added '{file_path}' to files_accessed")
 
     def _build_task_result(self) -> Dict[str, Any]:
         """Build the final task result"""
