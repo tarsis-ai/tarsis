@@ -11,7 +11,7 @@ python-dotenv==1.0.1
 # LLM Providers
 anthropic==0.40.0  # For Claude models (optional)
 openai==1.55.0  # For OpenAI models (optional)
-google-generativeai==0.8.3  # For Gemini models (optional)
+google-genai>=1.49.0  # For Gemini models (optional, new API)
 
 # JSON schema validation (optional, for tool schemas)
 pydantic==2.10.2

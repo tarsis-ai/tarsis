@@ -7,9 +7,11 @@ import logging
 from typing import List, Dict, Any, Optional, AsyncIterator
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 except ImportError:
     genai = None
+    types = None
 
 from .provider import (
     ILLMProvider,
@@ -76,8 +78,8 @@ class GeminiProvider(BaseLLMProvider):
 
         if genai is None:
             raise ImportError(
-                "google-generativeai package is required for Gemini provider. "
-                "Install with: pip install google-generativeai"
+                "google-genai package is required for Gemini provider. "
+                "Install with: pip install google-genai"
             )
 
         # Get API key from env if not provided
@@ -85,11 +87,8 @@ class GeminiProvider(BaseLLMProvider):
         if not self.api_key:
             raise ValueError("Gemini API key required (set GEMINI_API_KEY env var)")
 
-        # Configure the SDK
-        genai.configure(api_key=self.api_key)
-
-        # Initialize the model
-        self.model = genai.GenerativeModel(model_name=self.model_id)
+        # Initialize the client with the new API
+        self.client = genai.Client(api_key=self.api_key)
 
         logger.info(f"Gemini provider initialized with model: {self.model_id}")
 
@@ -139,26 +138,35 @@ class GeminiProvider(BaseLLMProvider):
         if tools:
             gemini_tools = self._convert_tools_to_gemini_format(tools)
 
-        # Create model with system instruction and tools
-        model = genai.GenerativeModel(
-            model_name=self.model_id,
-            system_instruction=system_prompt if system_prompt else None,
-            tools=gemini_tools
-        )
+        # Build configuration using types.GenerateContentConfig
+        config_params = {
+            'temperature': temperature,
+            'max_output_tokens': max_tokens,
+        }
 
-        # Configure generation
-        generation_config = genai.GenerationConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens
-        )
+        # Add system instruction if provided
+        if system_prompt:
+            config_params['system_instruction'] = system_prompt
+
+        # Add tools if provided
+        if gemini_tools:
+            config_params['tools'] = gemini_tools
+            # Disable automatic function calling
+            config_params['automatic_function_calling'] = types.AutomaticFunctionCallingConfig(
+                disable=True
+            )
+
+        # Create typed config object
+        config = types.GenerateContentConfig(**config_params)
 
         logger.debug(f"Creating Gemini message with {len(gemini_messages)} messages, "
                     f"max_tokens={max_tokens}, tools={'enabled' if gemini_tools else 'disabled'}")
 
-        # Generate content
-        response = model.generate_content(
-            gemini_messages,
-            generation_config=generation_config
+        # Generate content using the new API
+        response = self.client.models.generate_content(
+            model=self.model_id,
+            contents=gemini_messages,
+            config=config
         )
 
         # Log response details
@@ -192,24 +200,32 @@ class GeminiProvider(BaseLLMProvider):
         if tools:
             gemini_tools = self._convert_tools_to_gemini_format(tools)
 
-        # Create model with system instruction and tools
-        model = genai.GenerativeModel(
-            model_name=self.model_id,
-            system_instruction=system_prompt if system_prompt else None,
-            tools=gemini_tools
-        )
+        # Build configuration using types.GenerateContentConfig
+        config_params = {
+            'temperature': temperature,
+            'max_output_tokens': max_tokens,
+        }
 
-        # Configure generation
-        generation_config = genai.GenerationConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens
-        )
+        # Add system instruction if provided
+        if system_prompt:
+            config_params['system_instruction'] = system_prompt
 
-        # Stream response
-        response = model.generate_content(
-            gemini_messages,
-            generation_config=generation_config,
-            stream=True
+        # Add tools if provided
+        if gemini_tools:
+            config_params['tools'] = gemini_tools
+            # Disable automatic function calling
+            config_params['automatic_function_calling'] = types.AutomaticFunctionCallingConfig(
+                disable=True
+            )
+
+        # Create typed config object
+        config = types.GenerateContentConfig(**config_params)
+
+        # Stream response using the new API
+        response = self.client.models.generate_content_stream(
+            model=self.model_id,
+            contents=gemini_messages,
+            config=config
         )
 
         for chunk in response:
@@ -235,6 +251,8 @@ class GeminiProvider(BaseLLMProvider):
         }
         """
         formatted = []
+        # Track mapping from tool_use_id to function name for function responses
+        tool_use_id_to_name = {}
 
         for msg in messages:
             role = msg["role"]
@@ -258,18 +276,32 @@ class GeminiProvider(BaseLLMProvider):
                         if block_type == "text":
                             parts.append({"text": block.get("text", "")})
 
+                        elif block_type == "tool_use":
+                            # Track tool_use blocks from assistant messages
+                            # We need this mapping to correctly format function responses later
+                            tool_use_id = block.get("id", "")
+                            function_name = block.get("name", "")
+                            if tool_use_id and function_name:
+                                tool_use_id_to_name[tool_use_id] = function_name
+
                         elif block_type == "tool_result":
                             # Convert tool result to function response
                             tool_use_id = block.get("tool_use_id", "")
                             result_content = block.get("content", "")
 
-                            # Gemini expects function responses in a specific format
-                            parts.append({
-                                "function_response": {
-                                    "name": tool_use_id,  # Use tool_use_id as name
-                                    "response": {"result": result_content}
-                                }
-                            })
+                            # Look up the actual function name from our mapping
+                            function_name = tool_use_id_to_name.get(tool_use_id, tool_use_id)
+
+                            if not function_name:
+                                logger.warning(f"Could not find function name for tool_use_id: {tool_use_id}")
+                                continue
+
+                            # Use typed Part object for function response
+                            function_response_part = types.Part.from_function_response(
+                                name=function_name,
+                                response={'result': result_content}
+                            )
+                            parts.append(function_response_part)
 
             if parts:
                 formatted.append({
@@ -279,7 +311,7 @@ class GeminiProvider(BaseLLMProvider):
 
         return formatted
 
-    def _convert_tools_to_gemini_format(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _convert_tools_to_gemini_format(self, tools: List[Dict[str, Any]]) -> List[Any]:
         """
         Convert Anthropic tool format to Gemini format.
 
@@ -290,25 +322,34 @@ class GeminiProvider(BaseLLMProvider):
             "input_schema": {...}
         }
 
-        Gemini format:
-        {
-            "name": "tool_name",
-            "description": "...",
-            "parameters": {...}
-        }
+        New Gemini API format:
+        types.Tool(function_declarations=[
+            types.FunctionDeclaration(
+                name="tool_name",
+                description="...",
+                parameters_json_schema={...}  # Standard JSON schema
+            )
+        ])
         """
-        gemini_tools = []
+        function_declarations = []
 
         for tool in tools:
-            gemini_tools.append({
-                "name": tool["name"],
-                "description": tool["description"],
-                "parameters": tool["input_schema"]  # Just rename the field
-            })
+            # Use standard JSON schema (already in correct format from Anthropic)
+            input_schema = tool["input_schema"]
+
+            function_declaration = types.FunctionDeclaration(
+                name=tool["name"],
+                description=tool["description"],
+                parameters_json_schema=input_schema
+            )
+            function_declarations.append(function_declaration)
+
+        # Wrap all function declarations in a single Tool object
+        gemini_tool = types.Tool(function_declarations=function_declarations)
 
         logger.debug(f"Converted {len(tools)} tools to Gemini format")
 
-        return gemini_tools
+        return [gemini_tool]  # Return as list containing single Tool object
 
     def _parse_gemini_response(self, response: Any) -> AssistantMessage:
         """
@@ -329,17 +370,27 @@ class GeminiProvider(BaseLLMProvider):
         # Extract function calls (tool uses)
         if hasattr(response, 'candidates') and response.candidates:
             candidate = response.candidates[0]
-            if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                for i, part in enumerate(candidate.content.parts):
+            if (hasattr(candidate, 'content') and
+                hasattr(candidate.content, 'parts') and
+                candidate.content.parts is not None):
+                tool_call_index = 0
+                for part in candidate.content.parts:
                     if hasattr(part, 'function_call'):
                         fc = part.function_call
+
+                        # Validate function call has a non-empty name
+                        if not hasattr(fc, 'name') or not fc.name or fc.name.strip() == "":
+                            logger.warning(f"Skipping malformed function call with empty name")
+                            continue
+
                         # Convert to Anthropic tool_use format
                         content_blocks.append({
                             "type": "tool_use",
-                            "id": f"tool_{i}",  # Generate ID
+                            "id": f"tool_{tool_call_index}",  # Generate ID
                             "name": fc.name,
                             "input": dict(fc.args) if fc.args else {}
                         })
+                        tool_call_index += 1
 
         # If no content blocks, return empty text
         if not content_blocks:
@@ -401,7 +452,9 @@ class GeminiProvider(BaseLLMProvider):
         # Extract function calls if available
         if hasattr(chunk, 'candidates') and chunk.candidates:
             candidate = chunk.candidates[0]
-            if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+            if (hasattr(candidate, 'content') and
+                hasattr(candidate.content, 'parts') and
+                candidate.content.parts is not None):
                 function_calls = []
                 for part in candidate.content.parts:
                     if hasattr(part, 'function_call'):
