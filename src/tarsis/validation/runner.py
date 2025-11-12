@@ -235,18 +235,20 @@ class TestRunner:
         duration: float
     ) -> TestResult:
         """Parse pytest output"""
-        # pytest summary line: "====== X passed, Y failed in Z.ZZs ======"
-        summary_pattern = r'=+\s*(\d+)\s*passed(?:,\s*(\d+)\s*failed)?(?:,\s*(\d+)\s*skipped)?'
-        match = re.search(summary_pattern, stdout)
+        # pytest summary line can be in different orders:
+        # "====== X passed in Z.ZZs ======" (all passed)
+        # "====== X failed, Y passed in Z.ZZs ======" (some failed)
+        # "====== X passed, Y failed in Z.ZZs ======" (some failed, alternate order)
+        # "====== X passed, Y failed, Z skipped in Z.ZZs ======" (with skipped)
 
-        passed = 0
-        failed = 0
-        skipped = 0
+        # Extract all components separately
+        passed_match = re.search(r'(\d+)\s+passed', stdout)
+        failed_match = re.search(r'(\d+)\s+failed', stdout)
+        skipped_match = re.search(r'(\d+)\s+skipped', stdout)
 
-        if match:
-            passed = int(match.group(1))
-            failed = int(match.group(2)) if match.group(2) else 0
-            skipped = int(match.group(3)) if match.group(3) else 0
+        passed = int(passed_match.group(1)) if passed_match else 0
+        failed = int(failed_match.group(1)) if failed_match else 0
+        skipped = int(skipped_match.group(1)) if skipped_match else 0
 
         total = passed + failed + skipped
 

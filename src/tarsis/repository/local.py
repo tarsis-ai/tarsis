@@ -159,6 +159,14 @@ class CloneManager:
             if branch and branch != self._current_branch:
                 logger.info(f"Checking out branch: {branch}")
                 await self.checkout_branch(branch)
+
+            # Pull latest changes from remote
+            logger.info(f"Pulling latest changes from remote for branch: {branch or self._current_branch}")
+            try:
+                await self.update(branch)
+            except CloneError as e:
+                logger.warning(f"Failed to pull latest changes: {e}. Using cached clone.")
+
             return str(self._clone_path)
 
         # Perform clone with retry logic
