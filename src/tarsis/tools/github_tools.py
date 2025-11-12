@@ -296,6 +296,20 @@ To proceed: Call this tool again after running validation."""
             else:
                 body += "\n\n---\n⚠️ **Validation:** Did not pass all checks (see logs for details)\n"
 
+            # REFLEXION: Add reflection summary if available
+            if hasattr(context, 'reflection_manager') and context.reflection_manager:
+                rm = context.reflection_manager
+                if rm.has_reflections():
+                    body += "\n\n## 🧠 AI Learning Summary\n\n"
+                    body += rm.get_learning_summary()
+                    body += f"\n- **Reflections triggered**: {len(rm.memory.entries)}\n"
+                    body += f"- **Lessons applied**: {rm.count_applied_lessons()}\n"
+
+                    # Add trial info for multi-trial mode
+                    if hasattr(context, 'trial_number') and context.trial_number > 1:
+                        body += f"- **Trials needed**: {context.trial_number}\n"
+                        body += f"- **Mode**: {getattr(context, 'reflection_mode', 'unknown')}\n"
+
             # Create PR
             pr = await github.create_pull_request(title, body, head_branch, base_branch)
 

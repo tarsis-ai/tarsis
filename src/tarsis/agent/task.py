@@ -91,6 +91,7 @@ class AgentTask:
         self.conversation_history: List[Message] = []
         self.iteration_count = 0
         self.consecutive_mistakes = 0
+        self.consecutive_empty_responses = 0  # Track empty responses to detect stuck state
         self.abort_requested = False
 
         # Context tracking
@@ -98,6 +99,7 @@ class AgentTask:
         self.files_modified: set = set()
         self.branch_name: Optional[str] = None
         self.pr_url: Optional[str] = None
+        self.tools_used_count: Dict[str, int] = {}  # Track tool usage counts
 
         # Validation tracking
         self.validation_performed: bool = False
@@ -107,6 +109,16 @@ class AgentTask:
         # Local repository clone management
         self.clone_manager: Optional[Any] = None
         self._initialize_clone_manager()
+
+        # Reflexion framework state
+        self.reflection_manager: Optional[Any] = None
+        self.reflection_config: Optional[Any] = None  # Store config for access
+        self.reflection_mode: str = "within_task"  # within_task, multi_trial, or hybrid
+        self.trial_number: int = 0  # For multi-trial mode
+        self.last_reflection_iteration: Optional[int] = None
+        self.completion_message: Optional[str] = None  # For trial success detection
+        self.original_task_description: Optional[str] = None  # Store for pre-completion verification
+        self._initialize_reflection_manager()
 
     def _initialize_clone_manager(self) -> None:
         """Initialize the clone manager for local repository operations."""
@@ -134,9 +146,43 @@ class AgentTask:
         except Exception as e:
             logger.warning(f"Failed to initialize clone manager: {e}")
 
+    def _initialize_reflection_manager(self) -> None:
+        """Initialize the Reflexion framework for self-reflection and learning."""
+        try:
+            from .reflection import ReflectionManager, ReflectionConfig
+
+            # Load configuration from environment
+            config = ReflectionConfig.from_env(os.environ)
+
+            # Store config for access in tool handlers
+            self.reflection_config = config
+
+            # Skip initialization if disabled
+            if not config.enabled:
+                logger.info("Reflexion framework disabled via configuration")
+                return
+
+            # Create reflection manager
+            self.reflection_manager = ReflectionManager(
+                llm_provider=self.llm_provider,
+                config=config
+            )
+            self.reflection_mode = config.mode
+
+            logger.info(f"🧠 Reflexion framework initialized (mode: {config.mode})")
+        except ImportError as e:
+            logger.warning(f"ReflectionManager not available: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize reflection manager: {e}")
+
     async def execute(self, initial_prompt: str) -> Dict[str, Any]:
         """
         Main entry point to execute the task.
+
+        Supports multiple Reflexion modes:
+        - within_task: Reflect during single task execution (default)
+        - multi_trial: Trial-based learning with full resets
+        - hybrid: Within-task first, escalate to multi-trial if needed
 
         Args:
             initial_prompt: The initial user prompt (e.g., issue description)
@@ -147,19 +193,45 @@ class AgentTask:
         logger.info(f"Starting task execution for issue #{self.config.issue_number}")
         logger.debug(f"Initial prompt: {initial_prompt[:200]}...")
 
-        self.status = TaskStatus.IN_PROGRESS
+        # Store original task description for pre-completion verification
+        self.original_task_description = initial_prompt
 
         try:
-            # Build initial user message
-            user_content = self._build_initial_message(initial_prompt)
+            # REFLEXION: Initialize reflection manager
+            if self.reflection_manager:
+                await self.reflection_manager.initialize(
+                    self.config.repo_owner,
+                    self.config.repo_name
+                )
 
-            # Start the recursive loop
-            await self._initiate_task_loop(user_content)
+            # Determine execution mode
+            mode = self.reflection_mode if self.reflection_manager else "standard"
 
-            # Task completed successfully
-            self.status = TaskStatus.COMPLETED
-            logger.info(f"Task completed successfully in {self.iteration_count} iterations")
-            return self._build_task_result()
+            if mode == "multi_trial":
+                logger.info("🧠 Executing in multi-trial Reflexion mode")
+                return await self.execute_with_trials(initial_prompt)
+
+            elif mode == "hybrid":
+                logger.info("🧠 Executing in hybrid Reflexion mode (within-task → multi-trial)")
+                # Try within-task first
+                result = await self._execute_within_task(initial_prompt)
+
+                # If failed, escalate to multi-trial
+                if not self._is_trial_successful():
+                    logger.info("🔄 Hybrid mode: Escalating to multi-trial after failure")
+                    self._reset_for_next_trial()
+                    self.trial_number = 1  # First within-task counts as trial 1
+                    return await self.execute_with_trials(initial_prompt)
+
+                return result
+
+            else:  # within_task or standard
+                if mode == "within_task":
+                    logger.info("🧠 Executing in within-task Reflexion mode")
+                else:
+                    logger.info("Executing in standard mode (Reflexion disabled)")
+
+                return await self._execute_within_task(initial_prompt)
 
         except Exception as e:
             self.status = TaskStatus.FAILED
@@ -167,6 +239,18 @@ class AgentTask:
             raise
 
         finally:
+            # REFLEXION: Finalize reflection manager (save to cache if enabled)
+            if self.reflection_manager:
+                try:
+                    issue_number = str(self.config.issue_number)
+                    await self.reflection_manager.finalize(
+                        self.config.repo_owner,
+                        self.config.repo_name,
+                        issue_number
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to finalize reflection manager: {e}")
+
             # Cleanup local clone
             if self.clone_manager:
                 try:
@@ -174,6 +258,29 @@ class AgentTask:
                     await self.clone_manager.cleanup()
                 except Exception as e:
                     logger.warning(f"Failed to cleanup clone: {e}")
+
+    async def _execute_within_task(self, initial_prompt: str) -> Dict[str, Any]:
+        """
+        Execute task in within-task mode (standard execution with reflection).
+
+        Args:
+            initial_prompt: Task description
+
+        Returns:
+            Task result dict
+        """
+        self.status = TaskStatus.IN_PROGRESS
+
+        # Build initial user message
+        user_content = self._build_initial_message(initial_prompt)
+
+        # Start the recursive loop
+        await self._initiate_task_loop(user_content)
+
+        # Task completed successfully
+        self.status = TaskStatus.COMPLETED
+        logger.info(f"Task completed successfully in {self.iteration_count} iterations")
+        return self._build_task_result()
 
     async def _initiate_task_loop(self, user_content: Any) -> None:
         """
@@ -192,6 +299,21 @@ class AgentTask:
         while not self.abort_requested and self.iteration_count < self.config.max_iterations:
             # Check if we've made too many consecutive mistakes
             if self.consecutive_mistakes >= self.config.max_consecutive_mistakes:
+                # REFLEXION: Trigger reflection before aborting due to consecutive mistakes
+                if self.reflection_manager:
+                    from .reflection import ReflectionTrigger
+                    await self.reflection_manager.trigger_reflection(
+                        trigger=ReflectionTrigger.CONSECUTIVE_MISTAKES,
+                        context={
+                            "mistake_count": self.consecutive_mistakes,
+                            "recent_errors": self._get_recent_errors(),
+                            "iteration": self.iteration_count,
+                            "pattern": "repeated_failures"
+                        },
+                        conversation_history=self.conversation_history
+                    )
+                    self.last_reflection_iteration = self.iteration_count
+
                 raise Exception(
                     f"Stopping: {self.consecutive_mistakes} consecutive mistakes. "
                     "Please review and provide guidance."
@@ -238,6 +360,26 @@ class AgentTask:
         self.iteration_count += 1
 
         logger.info(f"=== Iteration {self.iteration_count}/{self.config.max_iterations} ===")
+
+        # REFLEXION: Periodic checkpoint reflection
+        if (self.reflection_manager and
+            self.iteration_count % 5 == 0 and  # Every 5 iterations (configurable)
+            self.iteration_count != self.last_reflection_iteration):
+
+            from .reflection import ReflectionTrigger
+            await self.reflection_manager.trigger_reflection(
+                trigger=ReflectionTrigger.PERIODIC,
+                context={
+                    "iteration": self.iteration_count,
+                    "files_accessed": len(self.files_accessed),
+                    "files_modified": len(self.files_modified),
+                    "validation_performed": self.validation_performed,
+                    "validation_passed": self.validation_passed,
+                    "tools_used": self._format_tools_used()
+                },
+                conversation_history=self.conversation_history
+            )
+            self.last_reflection_iteration = self.iteration_count
 
         # Add user message to history
         self.conversation_history.append(Message(
@@ -288,8 +430,25 @@ class AgentTask:
                             logger.debug(f"    Text preview: {block.get('text', '')[:200]}")
 
         if not tool_uses:
-            # No tools used - will prompt model to continue
+            # No tools used - track consecutive empty responses
+            self.consecutive_empty_responses += 1
+            logger.warning(f"Consecutive empty responses: {self.consecutive_empty_responses}")
+
+            # If stuck (too many consecutive empty responses), abort
+            MAX_EMPTY_RESPONSES = 5
+            if self.consecutive_empty_responses >= MAX_EMPTY_RESPONSES:
+                logger.error(f"Model appears stuck - {MAX_EMPTY_RESPONSES} consecutive empty responses. Aborting.")
+                raise Exception(
+                    f"Task aborted: Model returned {MAX_EMPTY_RESPONSES} consecutive empty responses. "
+                    "This usually indicates the model is stuck or confused. "
+                    "Try using a different LLM provider or model."
+                )
+
+            # Prompt model to continue
             return False
+
+        # Reset consecutive empty responses counter when tools are used
+        self.consecutive_empty_responses = 0
 
         # Execute tools and collect results
         tool_results = []
@@ -298,6 +457,65 @@ class AgentTask:
         for tool_use in tool_uses:
             # Check for completion tool
             if tool_use.name == "attempt_completion":
+                # REFLEXION: Trigger pre-completion verification
+                if self.reflection_manager and self.reflection_config.trigger_pre_completion:
+                    from .reflection import ReflectionTrigger
+                    logger.info("🧠 Triggering pre-completion verification reflection")
+
+                    await self.reflection_manager.trigger_reflection(
+                        trigger=ReflectionTrigger.PRE_COMPLETION,
+                        context={
+                            "original_task": self.original_task_description,
+                            "iterations_used": self.iteration_count,
+                            "files_modified": list(self.files_modified),
+                            "validation_performed": self.validation_performed,
+                            "validation_passed": self.validation_passed,
+                            "tools_used": dict(self.tools_used_count),
+                            "modified_files_list": "\n".join([f"- {f}" for f in self.files_modified]) if self.files_modified else "None",
+                            "completion_message": tool_use.input.get("result", "Task completed")
+                        },
+                        conversation_history=self.conversation_history
+                    )
+                    self.last_reflection_iteration = self.iteration_count
+
+                    # Get the latest reflection to check if task is truly complete
+                    if self.reflection_manager.memory.entries:
+                        latest_reflection = self.reflection_manager.memory.entries[-1]
+                        reflection_text = latest_reflection.insight.lower()
+
+                        # Check if reflection indicates incompleteness
+                        # Look for keywords that suggest missing requirements
+                        incomplete_indicators = [
+                            "incomplete", "missing", "not created", "haven't",
+                            "did not", "didn't", "should have", "need to",
+                            "required but", "not all", "partially"
+                        ]
+
+                        is_incomplete = any(indicator in reflection_text for indicator in incomplete_indicators)
+
+                        if is_incomplete:
+                            logger.warning("⚠️ Pre-completion verification detected incomplete requirements")
+                            # Add reflection to conversation as a reminder
+                            self.conversation_history.append(Message(
+                                role="user",
+                                content=[{
+                                    "type": "text",
+                                    "text": f"""⚠️ **Task Not Yet Complete**
+
+Your pre-completion verification revealed that the task is INCOMPLETE:
+
+{latest_reflection.insight}
+
+**You must address these missing requirements before calling attempt_completion again.**
+
+Please continue working on the task."""
+                                }]
+                            ))
+                            # Don't mark as completed - continue the loop
+                            continue
+                        else:
+                            logger.info("✅ Pre-completion verification passed - all requirements met")
+
                 did_use_attempt_completion = True
                 # Store completion message
                 self.completion_message = tool_use.input.get("result", "Task completed")
@@ -319,6 +537,9 @@ class AgentTask:
                 self.consecutive_mistakes = 0
                 logger.debug(f"Tool {tool_use.name} executed successfully")
 
+                # Track tool usage count for reflections
+                self.tools_used_count[tool_use.name] = self.tools_used_count.get(tool_use.name, 0) + 1
+
                 # Track context from tool metadata
                 self._update_context_from_tool_result(tool_use.name, result)
 
@@ -334,6 +555,24 @@ class AgentTask:
                         "skipped" in result_str  # Treat skipped as pass (e.g., no local clone yet)
                     )
                     logger.info(f"Validation performed: passed={self.validation_passed}")
+
+                    # REFLEXION: Trigger reflection on validation failure
+                    if not self.validation_passed and self.reflection_manager:
+                        from .reflection import ReflectionTrigger
+                        await self.reflection_manager.trigger_reflection(
+                            trigger=ReflectionTrigger.VALIDATION_FAILURE,
+                            context={
+                                "validation_result": result.metadata if hasattr(result, 'metadata') else {},
+                                "iteration": self.iteration_count,
+                                "files_modified": list(self.files_modified),
+                                "validation_summary": str(result.content)[:500],
+                                "failed_tests": str(result.content)[:1000],
+                                "lint_issues": "See validation summary",
+                                "static_errors": "See validation summary"
+                            },
+                            conversation_history=self.conversation_history
+                        )
+                        self.last_reflection_iteration = self.iteration_count
 
                 # Reset validation state if files are modified after validation
                 if tool_use.name in ["modify_file", "commit_changes", "modify_files_local"]:
@@ -355,6 +594,23 @@ class AgentTask:
                 # Track mistake
                 self.consecutive_mistakes += 1
                 logger.warning(f"Consecutive mistakes: {self.consecutive_mistakes}/{self.config.max_consecutive_mistakes}")
+
+                # REFLEXION: Trigger reflection on tool error
+                if self.reflection_manager:
+                    from .reflection import ReflectionTrigger
+                    await self.reflection_manager.trigger_reflection(
+                        trigger=ReflectionTrigger.TOOL_ERROR,
+                        context={
+                            "tool_name": tool_use.name,
+                            "error_message": str(e),
+                            "error_type": type(e).__name__,
+                            "tool_input": str(tool_use.input)[:500],
+                            "iteration": self.iteration_count,
+                            "consecutive_mistakes": self.consecutive_mistakes
+                        },
+                        conversation_history=self.conversation_history
+                    )
+                    self.last_reflection_iteration = self.iteration_count
 
         # If we have tool results, add them to conversation
         if tool_results and not did_use_attempt_completion:
@@ -401,6 +657,11 @@ class AgentTask:
 {file_list}
 """
             )
+
+        # REFLEXION: Add reflection insights if available
+        if self.reflection_manager and self.reflection_manager.has_reflections():
+            reflection_context = self.reflection_manager.memory.format_for_prompt()
+            builder.add_context_section("LEARNING_FROM_EXPERIENCE", reflection_context)
 
         # Build the prompt
         return builder.build()
@@ -519,6 +780,199 @@ class AgentTask:
             "pr_url": self.pr_url,
             "completion_message": getattr(self, "completion_message", "")
         }
+
+    def _get_recent_errors(self) -> List[str]:
+        """Extract recent errors from conversation history for reflection"""
+        errors = []
+        # Look at last 10 messages for error patterns
+        for msg in self.conversation_history[-10:]:
+            content_str = str(msg.content).lower()
+            if any(keyword in content_str for keyword in ["error", "failed", "exception", "traceback"]):
+                # Truncate long error messages
+                error_snippet = str(msg.content)[:200]
+                errors.append(error_snippet)
+
+        return errors if errors else ["No specific error messages captured"]
+
+    def _format_tools_used(self) -> str:
+        """Format tool usage counts for reflection context"""
+        tool_counts = {}
+
+        # Count tool uses from conversation history
+        for msg in self.conversation_history:
+            if hasattr(msg, 'content') and isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, dict) and block.get('type') == 'tool_use':
+                        tool_name = block.get('name', 'unknown')
+                        tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+
+        if not tool_counts:
+            return "No tools used yet"
+
+        # Format as list
+        formatted = []
+        for tool_name, count in sorted(tool_counts.items(), key=lambda x: x[1], reverse=True):
+            formatted.append(f"{tool_name}: {count} times")
+
+        return "\n".join(formatted)
+
+    def _is_trial_successful(self) -> bool:
+        """
+        Determine if current trial succeeded.
+
+        Returns:
+            True if trial completed successfully
+        """
+        success_criteria = [
+            self.status == TaskStatus.COMPLETED or self.completion_message is not None,
+            self.validation_passed or not self.validation_performed,
+            not self.abort_requested
+        ]
+
+        return all(success_criteria)
+
+    def _reset_for_next_trial(self) -> None:
+        """Reset state between trials while preserving learning"""
+        logger.info(f"🔄 Resetting for trial {self.trial_number + 1}")
+
+        # KEEP (preserve across trials):
+        # - self.reflection_manager (learning persists!)
+        # - self.trial_number (incremented in execute_with_trials)
+        # - self.config
+        # - self.llm_provider
+        # - self.tool_executor
+        # - self.clone_manager
+
+        # RESET (fresh state for new trial):
+        self.conversation_history = []
+        self.iteration_count = 0
+        self.consecutive_mistakes = 0
+        self.files_accessed = set()
+        self.files_modified = set()
+        self.branch_name = None
+        self.pr_url = None
+        self.validation_performed = False
+        self.validation_passed = False
+        self.last_validation_iteration = None
+        self.last_reflection_iteration = None
+        self.completion_message = None
+        self.abort_requested = False
+        self.status = TaskStatus.PENDING
+
+        logger.debug("State reset complete, reflections preserved")
+
+    async def _reflect_on_trial_failure(self, trial_num: int) -> None:
+        """Generate comprehensive reflection on failed trial"""
+        logger.info(f"🧠 Reflecting on trial {trial_num + 1} failure...")
+
+        if not self.reflection_manager:
+            return
+
+        from .reflection import ReflectionTrigger
+
+        # Build comprehensive trial summary
+        trial_summary = {
+            "trial_number": trial_num + 1,
+            "iterations_used": self.iteration_count,
+            "files_modified": list(self.files_modified),
+            "validation_performed": self.validation_performed,
+            "validation_passed": self.validation_passed,
+            "abort_reason": "consecutive_mistakes" if self.abort_requested else "incomplete",
+            "completion_attempted": self.completion_message is not None,
+            "tools_used": self._format_tools_used(),
+            "key_decisions": "See conversation history",
+            "full_conversation": f"Trial used {self.iteration_count} iterations"
+        }
+
+        # Trigger comprehensive trial reflection
+        await self.reflection_manager.trigger_reflection(
+            trigger=ReflectionTrigger.TRIAL_FAILURE,
+            context=trial_summary,
+            conversation_history=self.conversation_history
+        )
+
+    async def execute_with_trials(self, initial_prompt: str) -> Dict[str, Any]:
+        """
+        Execute task with multi-trial Reflexion approach.
+
+        The agent will attempt the task multiple times, learning from
+        each failure through self-reflection.
+
+        Args:
+            initial_prompt: Initial task description
+
+        Returns:
+            Task result dict
+        """
+        max_trials = 5  # Default, will be configurable
+        if self.reflection_manager:
+            max_trials = self.reflection_manager.config.max_trials
+
+        for trial in range(max_trials):
+            self.trial_number = trial + 1
+            logger.info(f"🔄 Trial {self.trial_number}/{max_trials} starting")
+
+            # Add trial context to prompt for subsequent trials
+            trial_prompt = initial_prompt
+            if trial > 0:
+                trial_context = f"\n\n**TRIAL {self.trial_number}**: You have attempted this task {trial} time(s) before and it did not succeed. Review your reflections carefully and try a different approach."
+                trial_prompt = initial_prompt + trial_context
+
+            # Run single trial
+            try:
+                result = await self._run_single_trial(trial_prompt)
+
+                # Evaluate success
+                if self._is_trial_successful():
+                    logger.info(f"✅ Success on trial {self.trial_number}!")
+                    return {
+                        **result,
+                        "trials_used": self.trial_number,
+                        "learning_applied": True,
+                        "reflexion_mode": "multi_trial"
+                    }
+            except Exception as e:
+                logger.warning(f"Trial {self.trial_number} failed with exception: {e}")
+                # Continue to next trial
+
+            # Don't reflect on last trial (no point)
+            if trial < max_trials - 1:
+                # Generate comprehensive trial-level reflection
+                await self._reflect_on_trial_failure(trial)
+
+                # Reset state for next trial
+                self._reset_for_next_trial()
+
+        logger.warning(f"⚠️ Max trials ({max_trials}) reached without success")
+        return {
+            "status": "failed",
+            "trials_used": max_trials,
+            "success": False,
+            "reason": "max_trials_exceeded",
+            "reflexion_mode": "multi_trial"
+        }
+
+    async def _run_single_trial(self, initial_prompt: str) -> Dict[str, Any]:
+        """
+        Run a single trial (standard agent execution).
+
+        Args:
+            initial_prompt: Task description (may include trial context)
+
+        Returns:
+            Task result dict
+        """
+        # Reset iteration-specific state
+        self.status = TaskStatus.IN_PROGRESS
+
+        # Build initial user message
+        user_content = self._build_initial_message(initial_prompt)
+
+        # Execute standard agent loop
+        await self._initiate_task_loop(user_content)
+
+        # Build result
+        return self._build_task_result()
 
     def abort(self) -> None:
         """Request task abort"""
