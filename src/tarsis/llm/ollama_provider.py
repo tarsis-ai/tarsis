@@ -96,7 +96,6 @@ class OllamaProvider(BaseLLMProvider):
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout_config)
 
         # Determine if we should use structured output (grammar-based tool calling)
-        # Default to False to avoid grammar parser crashes
         if use_structured_output is None:
             env_value = os.getenv("OLLAMA_STRUCTURED_OUTPUT", "false").lower()
             self.use_structured_output = env_value in ("true", "1", "yes")
@@ -621,7 +620,7 @@ class OllamaProvider(BaseLLMProvider):
             # Plain text response
             content = [{"type": "text", "text": content}]
         else:
-            # Empty content - return empty list to avoid downstream errors
+            # Handle empty content
             logger.error("Ollama returned completely empty content - no text and no tool calls!")
             content = []
 

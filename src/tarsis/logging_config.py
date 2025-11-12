@@ -86,7 +86,7 @@ def configure_logging(
     root_logger = logging.getLogger()
     root_logger.setLevel(numeric_level)
 
-    # Remove existing handlers to avoid duplicates
+    # Clear existing handlers
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 

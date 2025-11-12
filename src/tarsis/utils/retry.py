@@ -116,7 +116,7 @@ def calculate_delay(
     # Calculate exponential delay
     delay = min(base_delay * (exponential_base ** attempt), max_delay)
 
-    # Add jitter to prevent thundering herd
+    # Apply jitter to delay
     if jitter:
         delay = delay * (0.5 + random.random() * 0.5)
 

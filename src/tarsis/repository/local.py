@@ -154,7 +154,7 @@ class CloneManager:
         Raises:
             CloneError: If cloning fails after all retries
         """
-        # If already cloned and on correct branch, return immediately
+        # If already cloned, pull latest changes before returning
         if self.is_cloned():
             if branch and branch != self._current_branch:
                 logger.info(f"Checking out branch: {branch}")
