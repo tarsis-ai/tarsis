@@ -6,8 +6,11 @@ enabling features that are impossible or inefficient via the GitHub API:
 - File rename with history preservation
 - Symlink creation and management
 - Batch file operations with atomic commits
+- Branch creation and inspection
+- Git diff operations
 """
 
+import asyncio
 import logging
 from typing import Dict, Any, List
 from pathlib import Path
@@ -1034,3 +1037,599 @@ All changes have been committed atomically in a single commit."""
                 summary_lines.append(f"- {count} file(s) {op_type}d")
 
         return "\n".join(summary_lines) if summary_lines else "- No operations"
+
+
+class CreateBranchLocalHandler(BaseToolHandler):
+    """
+    Tool to create a new branch via local git operations.
+
+    Creates branches locally using git checkout -b, which is much faster than
+    the GitHub API and works offline.
+    """
+
+    @property
+    def name(self) -> str:
+        return "create_branch_local"
+
+    @property
+    def category(self) -> ToolCategory:
+        return ToolCategory.GIT
+
+    def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description="""Create a new branch via local git operations.
+
+**Advantages over GitHub API:**
+- ⚡ Faster (no network calls)
+- 🔌 Works offline
+- 🔄 More reliable (no rate limits)
+- 🎯 Direct git operations
+
+**How it works:**
+1. Ensures repository is cloned locally
+2. Creates branch from specified base (or current HEAD)
+3. Optionally pushes branch to remote
+
+**When to use:**
+- Creating feature branches for implementation
+- Creating hotfix branches
+- Any branch creation that doesn't require immediate GitHub visibility
+- Batch operations where speed matters
+
+**Branch naming:**
+- Use descriptive names (e.g., 'feature/add-auth', 'fix/memory-leak')
+- Avoid special characters except dash and underscore
+- Branch names are case-sensitive
+
+**Example:**
+Create branch 'feature/new-api' from 'main' and push to remote.""",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "branch_name": {
+                        "type": "string",
+                        "description": "Name of the branch to create (e.g., 'feature/add-login', 'fix/bug-123')"
+                    },
+                    "base_ref": {
+                        "type": "string",
+                        "description": "Base branch or commit SHA to create from (default: current HEAD). Examples: 'main', 'develop', or a commit SHA"
+                    },
+                    "push_to_remote": {
+                        "type": "boolean",
+                        "description": "Whether to push the new branch to remote after creation (default: false)",
+                        "default": False
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "If true and branch exists, reset it to base_ref. If false and branch exists, return error (default: false)",
+                        "default": False
+                    }
+                },
+                "required": ["branch_name"]
+            },
+            category=self.category
+        )
+
+    async def execute(self, input_data: Dict[str, Any], context: Any) -> ToolResponse:
+        """Execute local branch creation."""
+
+        try:
+            # 1. Extract parameters
+            branch_name = input_data["branch_name"]
+            base_ref = input_data.get("base_ref")
+            push_to_remote = input_data.get("push_to_remote", False)
+            force = input_data.get("force", False)
+
+            # Validate branch name
+            if not branch_name or not branch_name.strip():
+                return self._error_response(
+                    Exception("branch_name cannot be empty")
+                )
+
+            branch_name = branch_name.strip()
+
+            # 2. Validate clone manager
+            if not hasattr(context, "clone_manager") or not context.clone_manager:
+                return self._error_response(
+                    Exception(
+                        "Clone manager not available. "
+                        "Local git operations require CloneManager initialization."
+                    )
+                )
+
+            # 3. Ensure repository is cloned
+            logger.info(f"Ensuring clone for branch creation")
+            repo_path = await context.clone_manager.ensure_clone(shallow=False)
+
+            # 4. Get GitPython Repo instance
+            repo = context.clone_manager._repo
+            if not repo:
+                return self._error_response(
+                    Exception("Repository not available after clone")
+                )
+
+            # 5. Check if branch already exists
+            branch_exists = False
+            try:
+                # Check local branches
+                existing_branches = [ref.name for ref in repo.heads]
+                branch_exists = branch_name in existing_branches
+            except Exception as e:
+                logger.warning(f"Failed to check existing branches: {e}")
+
+            if branch_exists and not force:
+                return self._error_response(
+                    Exception(
+                        f"Branch '{branch_name}' already exists locally. "
+                        f"Use force=true to reset it to the base reference, "
+                        f"or choose a different branch name."
+                    )
+                )
+
+            # 6. Checkout base reference if specified
+            if base_ref:
+                logger.info(f"Checking out base reference: {base_ref}")
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        repo.git.checkout,
+                        base_ref
+                    )
+                except Exception as e:
+                    return self._error_response(
+                        Exception(
+                            f"Failed to checkout base reference '{base_ref}': {e}. "
+                            f"Ensure the reference exists in the repository."
+                        )
+                    )
+
+            # 7. Get the current commit SHA (will be the base of new branch)
+            base_commit_sha = repo.head.commit.hexsha
+
+            # 8. Create or reset branch
+            logger.info(f"Creating branch '{branch_name}' from {base_commit_sha[:8]}")
+            try:
+                loop = asyncio.get_event_loop()
+                if branch_exists and force:
+                    # Reset existing branch to base
+                    await loop.run_in_executor(
+                        None,
+                        repo.git.checkout,
+                        "-B",  # Create or reset branch
+                        branch_name
+                    )
+                    action = "reset"
+                else:
+                    # Create new branch
+                    await loop.run_in_executor(
+                        None,
+                        repo.git.checkout,
+                        "-b",
+                        branch_name
+                    )
+                    action = "created"
+            except Exception as e:
+                return self._error_response(
+                    Exception(f"Failed to create branch: {e}")
+                )
+
+            # Update clone manager's current branch tracker
+            context.clone_manager._current_branch = branch_name
+
+            # 9. Push to remote if requested
+            push_status = "local only (not pushed)"
+            if push_to_remote:
+                try:
+                    logger.info(f"Pushing branch '{branch_name}' to remote")
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: repo.git.push(
+                            "origin",
+                            branch_name,
+                            "--set-upstream"
+                        )
+                    )
+                    push_status = "pushed to remote"
+                except Exception as e:
+                    return self._error_response(
+                        Exception(
+                            f"Branch '{branch_name}' created locally but push failed: {e}\n\n"
+                            f"The branch exists in your local repository at {base_commit_sha[:8]}. "
+                            f"You can push it manually later with: git push origin {branch_name}"
+                        )
+                    )
+
+            # 10. Build success message
+            success_message = f"""✅ Branch {action} successfully!
+
+**Branch:** `{branch_name}`
+**Base commit:** {base_commit_sha[:8]}
+**Status:** {push_status}
+
+You can now use this branch for your changes."""
+
+            if base_ref:
+                success_message += f"\n**Created from:** `{base_ref}`"
+
+            return self._success_response(
+                success_message,
+                metadata={
+                    "branch_name": branch_name,
+                    "base_commit": base_commit_sha,
+                    "base_ref": base_ref,
+                    "pushed": push_to_remote,
+                    "action": action,
+                    "operation": "create_branch_local"
+                }
+            )
+
+        except Exception as e:
+            logger.exception("Unexpected error in create_branch_local")
+            return self._error_response(e)
+
+
+class GetBranchesLocalHandler(BaseToolHandler):
+    """
+    Tool to list and inspect branches via local git operations.
+
+    Provides information about local and remote branches, including the current
+    active branch and tracking information.
+    """
+
+    @property
+    def name(self) -> str:
+        return "get_branches_local"
+
+    @property
+    def category(self) -> ToolCategory:
+        return ToolCategory.GIT
+
+    def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description="""List and inspect branches via local git operations.
+
+**Information provided:**
+- 📍 Current active branch
+- 📋 All local branches
+- 🌐 Remote branches (from origin)
+- 🔗 Tracking relationships between local and remote branches
+- 📊 Latest commit SHA for each branch
+
+**When to use:**
+- Verify which branch you're currently on
+- List available branches before switching
+- Check if a branch exists before creating
+- Understand branch tracking relationships
+- Inspect branch state before operations
+
+**Advantages over GitHub API:**
+- ⚡ Faster (no network calls for local branches)
+- 📦 Shows both local and remote branches in one call
+- 🎯 Includes tracking information
+
+**Example:**
+Check which branch you're on and what other branches are available.""",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "include_remote": {
+                        "type": "boolean",
+                        "description": "Whether to include remote branches from origin (default: true)",
+                        "default": True
+                    }
+                },
+                "required": []
+            },
+            category=self.category
+        )
+
+    async def execute(self, input_data: Dict[str, Any], context: Any) -> ToolResponse:
+        """Execute branch listing."""
+
+        try:
+            # 1. Extract parameters
+            include_remote = input_data.get("include_remote", True)
+
+            # 2. Validate clone manager
+            if not hasattr(context, "clone_manager") or not context.clone_manager:
+                return self._error_response(
+                    Exception(
+                        "Clone manager not available. "
+                        "Local git operations require CloneManager initialization."
+                    )
+                )
+
+            # 3. Ensure repository is cloned
+            logger.info("Ensuring clone for branch inspection")
+            repo_path = await context.clone_manager.ensure_clone(shallow=False)
+
+            # 4. Get GitPython Repo instance
+            repo = context.clone_manager._repo
+            if not repo:
+                return self._error_response(
+                    Exception("Repository not available after clone")
+                )
+
+            # 5. Get current branch
+            try:
+                current_branch = repo.active_branch.name
+            except Exception as e:
+                # Might be in detached HEAD state
+                current_branch = f"(detached at {repo.head.commit.hexsha[:8]})"
+                logger.warning(f"Not on a branch: {e}")
+
+            # 6. Get local branches
+            local_branches = []
+            for head in repo.heads:
+                branch_info = {
+                    "name": head.name,
+                    "commit": head.commit.hexsha,
+                    "is_current": head.name == current_branch
+                }
+
+                # Add tracking information if available
+                try:
+                    tracking = head.tracking_branch()
+                    if tracking:
+                        branch_info["tracking"] = tracking.name
+                except Exception:
+                    pass
+
+                local_branches.append(branch_info)
+
+            # 7. Get remote branches if requested
+            remote_branches = []
+            if include_remote:
+                try:
+                    for ref in repo.remotes.origin.refs:
+                        # Skip HEAD reference
+                        if ref.name == "origin/HEAD":
+                            continue
+                        remote_branches.append({
+                            "name": ref.name,
+                            "commit": ref.commit.hexsha
+                        })
+                except Exception as e:
+                    logger.warning(f"Failed to get remote branches: {e}")
+
+            # 8. Build success message
+            success_message = f"""✅ Branch information retrieved!
+
+**Current branch:** `{current_branch}`
+
+**Local branches:** ({len(local_branches)} total)"""
+
+            for branch in local_branches:
+                marker = " ← current" if branch.get("is_current") else ""
+                tracking_info = f" → tracks {branch['tracking']}" if branch.get("tracking") else ""
+                success_message += f"\n- `{branch['name']}` @ {branch['commit'][:8]}{tracking_info}{marker}"
+
+            if include_remote and remote_branches:
+                success_message += f"\n\n**Remote branches:** ({len(remote_branches)} total)"
+                for branch in remote_branches[:10]:  # Limit to first 10 for readability
+                    success_message += f"\n- `{branch['name']}` @ {branch['commit'][:8]}"
+                if len(remote_branches) > 10:
+                    success_message += f"\n- ... and {len(remote_branches) - 10} more"
+
+            return self._success_response(
+                success_message,
+                metadata={
+                    "current_branch": current_branch,
+                    "local_branches": local_branches,
+                    "remote_branches": remote_branches if include_remote else [],
+                    "operation": "get_branches_local"
+                }
+            )
+
+        except Exception as e:
+            logger.exception("Unexpected error in get_branches_local")
+            return self._error_response(e)
+
+
+class GetDiffLocalHandler(BaseToolHandler):
+    """
+    Tool to get git diff via local git operations.
+
+    Shows differences between commits, branches, or the working directory,
+    useful for code review and understanding changes.
+    """
+
+    @property
+    def name(self) -> str:
+        return "get_diff_local"
+
+    @property
+    def category(self) -> ToolCategory:
+        return ToolCategory.GIT
+
+    def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description="""Get git diff via local git operations.
+
+**Diff modes:**
+1. **Between two refs** - Compare any two commits/branches/tags
+   - Set both `ref1` and `ref2` (e.g., 'main' and 'feature-branch')
+2. **Working directory vs HEAD** - Show unstaged changes
+   - Leave both `ref1` and `ref2` empty
+3. **Staged changes** - Show what would be committed
+   - Set `staged=true`
+4. **Single ref vs working directory** - Changes since a commit
+   - Set only `ref1`
+
+**When to use:**
+- Review changes before committing
+- Compare branches before merging
+- Understand what changed between commits
+- Verify modifications during implementation
+- Generate patches for review
+
+**Output format:**
+- Unified diff format (standard git diff)
+- Shows file paths, line numbers, additions (+), deletions (-)
+- Color-coded in supported terminals
+
+**Examples:**
+- Compare branches: `ref1="main"`, `ref2="feature-x"`
+- Show unstaged changes: (no parameters)
+- Show staged changes: `staged=true`
+- Changes since commit: `ref1="abc123"`""",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "ref1": {
+                        "type": "string",
+                        "description": "First reference (branch, commit, tag). If only ref1 provided, compares ref1 to working directory"
+                    },
+                    "ref2": {
+                        "type": "string",
+                        "description": "Second reference (branch, commit, tag). Compares ref1 to ref2"
+                    },
+                    "staged": {
+                        "type": "boolean",
+                        "description": "If true, show staged changes only (git diff --staged). Ignores ref1/ref2 (default: false)",
+                        "default": False
+                    },
+                    "paths": {
+                        "type": "array",
+                        "description": "Optional list of file paths to limit diff to specific files",
+                        "items": {"type": "string"}
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Number of context lines to show around changes (default: 3)",
+                        "default": 3
+                    }
+                },
+                "required": []
+            },
+            category=self.category
+        )
+
+    async def execute(self, input_data: Dict[str, Any], context: Any) -> ToolResponse:
+        """Execute git diff operation."""
+
+        try:
+            # 1. Extract parameters
+            ref1 = input_data.get("ref1")
+            ref2 = input_data.get("ref2")
+            staged = input_data.get("staged", False)
+            paths = input_data.get("paths", [])
+            context_lines = input_data.get("context_lines", 3)
+
+            # 2. Validate clone manager
+            if not hasattr(context, "clone_manager") or not context.clone_manager:
+                return self._error_response(
+                    Exception(
+                        "Clone manager not available. "
+                        "Local git operations require CloneManager initialization."
+                    )
+                )
+
+            # 3. Ensure repository is cloned
+            logger.info("Ensuring clone for diff operation")
+            repo_path = await context.clone_manager.ensure_clone(shallow=False)
+
+            # 4. Get GitPython Repo instance
+            repo = context.clone_manager._repo
+            if not repo:
+                return self._error_response(
+                    Exception("Repository not available after clone")
+                )
+
+            # 5. Build diff command
+            diff_args = [f"-U{context_lines}"]
+
+            if staged:
+                # Staged changes
+                diff_args.append("--staged")
+                diff_description = "staged changes"
+            elif ref1 and ref2:
+                # Between two refs
+                diff_args.append(f"{ref1}..{ref2}")
+                diff_description = f"{ref1} → {ref2}"
+            elif ref1:
+                # Single ref vs working directory
+                diff_args.append(ref1)
+                diff_description = f"{ref1} → working directory"
+            else:
+                # Working directory vs HEAD (unstaged changes)
+                diff_description = "unstaged changes (working directory vs HEAD)"
+
+            # Add paths if specified
+            if paths:
+                diff_args.append("--")
+                diff_args.extend(paths)
+
+            # 6. Execute diff
+            logger.info(f"Getting diff: {diff_description}")
+            try:
+                loop = asyncio.get_event_loop()
+                diff_output = await loop.run_in_executor(
+                    None,
+                    lambda: repo.git.diff(*diff_args)
+                )
+            except Exception as e:
+                return self._error_response(
+                    Exception(f"Failed to get diff: {e}")
+                )
+
+            # 7. Handle empty diff
+            if not diff_output or diff_output.strip() == "":
+                return self._success_response(
+                    f"No differences found for: {diff_description}",
+                    metadata={
+                        "diff": "",
+                        "ref1": ref1,
+                        "ref2": ref2,
+                        "staged": staged,
+                        "has_changes": False,
+                        "operation": "get_diff_local"
+                    }
+                )
+
+            # 8. Build success message with diff
+            # Truncate very large diffs for display
+            max_display_lines = 500
+            diff_lines = diff_output.split("\n")
+            truncated = len(diff_lines) > max_display_lines
+
+            if truncated:
+                display_diff = "\n".join(diff_lines[:max_display_lines])
+                display_diff += f"\n\n... (truncated {len(diff_lines) - max_display_lines} lines)"
+            else:
+                display_diff = diff_output
+
+            success_message = f"""✅ Diff retrieved successfully!
+
+**Comparing:** {diff_description}
+**Context lines:** {context_lines}
+**Total lines:** {len(diff_lines)}
+
+**Diff:**
+```diff
+{display_diff}
+```"""
+
+            return self._success_response(
+                success_message,
+                metadata={
+                    "diff": diff_output,  # Full diff in metadata
+                    "ref1": ref1,
+                    "ref2": ref2,
+                    "staged": staged,
+                    "paths": paths,
+                    "line_count": len(diff_lines),
+                    "truncated": truncated,
+                    "has_changes": True,
+                    "operation": "get_diff_local"
+                }
+            )
+
+        except Exception as e:
+            logger.exception("Unexpected error in get_diff_local")
+            return self._error_response(e)

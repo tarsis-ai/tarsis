@@ -90,6 +90,59 @@ Configure your GitHub repository to send issue comment webhooks to this endpoint
    - Run validation (tests, linting, type checking)
    - Create a pull request with the implementation
 
+## Repository Requirements
+
+**Important**: When enabling Tarsis for a repository, ensure that the test requirements and validation tools for that repository are installed **where Tarsis is running**.
+
+### Why This Matters
+
+Tarsis performs multi-tier validation (tests → static analysis → linting → syntax checking) on code changes before creating pull requests. To execute these validations, the necessary tools must be available in the environment where Tarsis is running.
+
+### What to Install
+
+Depending on your target repository's testing framework and language, install the following in Tarsis's environment:
+
+**Python Repositories:**
+```bash
+# In Tarsis's virtual environment
+pip install pytest              # If repository uses pytest
+pip install unittest            # Usually included in Python stdlib
+pip install mypy                # For type checking
+pip install pylint flake8       # For linting
+```
+
+**JavaScript/TypeScript Repositories:**
+```bash
+# Install Node.js dependencies globally or in Tarsis's environment
+npm install -g jest mocha vitest   # Test frameworks
+npm install -g typescript          # For type checking
+npm install -g eslint              # For linting
+```
+
+**Other Languages:**
+- **Go**: `go test` (requires Go SDK installed)
+- **Rust**: `cargo test` (requires Rust toolchain installed)
+- **Ruby**: `rspec` or `minitest` (requires Ruby and gems installed)
+
+### Validation Fallback
+
+If test tools are not available, Tarsis will automatically fall back to:
+1. **Static analysis** (if tools like `mypy`, `tsc` are available)
+2. **Linting** (if tools like `pylint`, `eslint` are available)
+3. **Syntax checking** (always available as final fallback)
+
+### Example Setup
+
+```bash
+# For a Python repository with pytest
+cd /path/to/tarsis
+source venv/bin/activate
+pip install pytest mypy pylint
+
+# Now Tarsis can run full validation on Python repositories
+python run.py
+```
+
 ## Architecture
 
 Tarsis uses a **recursive agent loop** with tool calling, inspired by modern AI coding assistants:
@@ -110,10 +163,10 @@ Task Tools      Validation Tools      Local Git Operations
 
 The agent autonomously plans and executes tasks using 20 production tools across multiple categories.
 
-## Current Status (v0.2.0)
+## Current Status (v0.3.1)
 
 - ✅ Core agentic architecture (recursive agent loop)
-- ✅ 20 production tools (GitHub, file operations, code search, validation, local git operations)
+- ✅ 23 production tools (GitHub, file operations, code search, validation, local git operations)
 - ✅ Multi-provider LLM support (Anthropic, Ollama, Google)
 - ✅ Intelligent file discovery and code search (hybrid approach with ripgrep)
 - ✅ **Advanced multi-tier validation system** (5 tiers: tests → static analysis → linting → syntax → dependency)

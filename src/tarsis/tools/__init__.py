@@ -43,7 +43,10 @@ from .validation_tools import (
 from .git_local_tools import (
     RenameFileHandler,
     CreateSymlinkHandler,
-    ModifyFilesLocalHandler
+    ModifyFilesLocalHandler,
+    CreateBranchLocalHandler,
+    GetBranchesLocalHandler,
+    GetDiffLocalHandler
 )
 
 
@@ -94,8 +97,11 @@ def create_default_tool_executor() -> ToolExecutor:
     executor.register(RenameFileHandler())
     executor.register(CreateSymlinkHandler())
     executor.register(ModifyFilesLocalHandler())
+    executor.register(CreateBranchLocalHandler())
+    executor.register(GetBranchesLocalHandler())
+    executor.register(GetDiffLocalHandler())
 
-    # Total: 20 tools (17 previous + 3 new local git tools)
+    # Total: 23 tools (17 previous + 6 local git tools)
     return executor
 
 
@@ -137,4 +143,7 @@ __all__ = [
     "RenameFileHandler",
     "CreateSymlinkHandler",
     "ModifyFilesLocalHandler",
+    "CreateBranchLocalHandler",
+    "GetBranchesLocalHandler",
+    "GetDiffLocalHandler",
 ]
