@@ -363,24 +363,54 @@ class GeminiProvider(BaseLLMProvider):
         try:
             if hasattr(response, 'text') and response.text:
                 content_blocks.append({"type": "text", "text": response.text})
-        except ValueError:
+        except ValueError as e:
             # response.text raises ValueError if there's no text (e.g., only function calls)
-            pass
+            logger.debug(f"No text in response: {e}")
+
+        # Track if we encountered malformed function calls
+        malformed_calls = []
+
+        # Debugging: check if we have candidates
+        if not hasattr(response, 'candidates') or not response.candidates:
+            logger.warning("Response has no candidates")
 
         # Extract function calls (tool uses)
         if hasattr(response, 'candidates') and response.candidates:
             candidate = response.candidates[0]
+
+            # Debugging: check candidate structure
+            if not hasattr(candidate, 'content'):
+                logger.warning("Candidate has no content attribute")
+            elif not hasattr(candidate.content, 'parts'):
+                logger.warning("Candidate content has no parts attribute")
+            elif candidate.content.parts is None:
+                logger.warning("Candidate content parts is None")
+
             if (hasattr(candidate, 'content') and
                 hasattr(candidate.content, 'parts') and
                 candidate.content.parts is not None):
+
+                # Log if we have no parts at all
+                if not candidate.content.parts:
+                    logger.warning("Response has content but no parts")
+
                 tool_call_index = 0
                 for part in candidate.content.parts:
+                    # Handle function calls
                     if hasattr(part, 'function_call'):
                         fc = part.function_call
 
                         # Validate function call has a non-empty name
                         if not hasattr(fc, 'name') or not fc.name or fc.name.strip() == "":
-                            logger.warning(f"Skipping malformed function call with empty name")
+                            # Log detailed info about malformed call for debugging
+                            args_info = dict(fc.args) if hasattr(fc, 'args') and fc.args else {}
+                            logger.warning(
+                                f"Skipping malformed function call with empty name. "
+                                f"Part type: {type(part).__name__}, "
+                                f"Has args: {hasattr(fc, 'args')}, "
+                                f"Args: {args_info}"
+                            )
+                            malformed_calls.append(args_info)
                             continue
 
                         # Convert to Anthropic tool_use format
@@ -392,8 +422,31 @@ class GeminiProvider(BaseLLMProvider):
                         })
                         tool_call_index += 1
 
-        # If no content blocks, return empty text
-        if not content_blocks:
+                    # Handle text parts (including thought_signature and other text-like parts)
+                    elif hasattr(part, 'text') and part.text:
+                        # Only add if we haven't already added text via response.text
+                        if not any(b.get('type') == 'text' for b in content_blocks):
+                            content_blocks.append({"type": "text", "text": part.text})
+
+                    # Log unexpected part types for debugging
+                    elif not hasattr(part, 'function_call'):
+                        part_type = type(part).__name__
+                        logger.debug(f"Encountered non-function-call part: {part_type}")
+
+        # If no content blocks but we had malformed calls, add error message
+        if not content_blocks and malformed_calls:
+            error_msg = (
+                "I encountered an issue with my response. "
+                "I tried to call a function but the call was malformed. "
+                "Let me try a different approach."
+            )
+            logger.error(
+                f"All function calls were malformed, returning error message. "
+                f"Malformed calls: {len(malformed_calls)}"
+            )
+            content_blocks = [{"type": "text", "text": error_msg}]
+        # If no content blocks at all, return empty text
+        elif not content_blocks:
             content_blocks = [{"type": "text", "text": ""}]
 
         # Log parsed content
@@ -402,6 +455,13 @@ class GeminiProvider(BaseLLMProvider):
             logger.debug(f"Parsed {len(tool_uses)} tool use(s) from response")
         else:
             logger.debug(f"Parsed text response (no tool uses)")
+
+        # Log warning if we skipped malformed calls but still have valid content
+        if malformed_calls and tool_uses:
+            logger.warning(
+                f"Skipped {len(malformed_calls)} malformed function call(s) "
+                f"but successfully parsed {len(tool_uses)} valid tool use(s)"
+            )
 
         # Extract usage metadata
         usage = None
@@ -417,13 +477,35 @@ class GeminiProvider(BaseLLMProvider):
         stop_reason = None
         if hasattr(response, 'candidates') and response.candidates:
             candidate = response.candidates[0]
+
+            # Log safety ratings if available for debugging
+            if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+                logger.debug(f"Safety ratings: {candidate.safety_ratings}")
+
             if hasattr(candidate, 'finish_reason'):
                 # Map Gemini finish reasons to Anthropic-like reasons
                 finish_reason = str(candidate.finish_reason)
+                logger.debug(f"Gemini finish_reason: {finish_reason}")
+
                 if 'STOP' in finish_reason:
                     stop_reason = "end_turn"
                 elif 'MAX_TOKENS' in finish_reason:
                     stop_reason = "max_tokens"
+                elif 'SAFETY' in finish_reason:
+                    logger.warning(
+                        f"Response stopped due to safety filters: {finish_reason}. "
+                        f"Safety ratings: {getattr(candidate, 'safety_ratings', 'N/A')}"
+                    )
+                    stop_reason = "stop_sequence"
+                elif 'RECITATION' in finish_reason:
+                    logger.warning(f"Response stopped due to recitation: {finish_reason}")
+                    stop_reason = "stop_sequence"
+                elif 'OTHER' in finish_reason:
+                    logger.warning(f"Response stopped for unspecified reason: {finish_reason}")
+                else:
+                    logger.warning(f"Unknown finish_reason: {finish_reason}")
+            else:
+                logger.warning("Candidate has no finish_reason attribute")
 
         return AssistantMessage(
             content=content_blocks,
